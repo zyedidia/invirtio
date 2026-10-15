@@ -74,18 +74,19 @@ This example assumes the following device:
 ```
 
 For WiFi you need a custom VDUSE module and the virtio-wlan module. This means
-you need to build them from linux-host and install them with `insmod`. You will
-also need to install the full custom kernel from linux-host, since the modules
-will not be compatible otherwise.
+you need to build them from linux-host and install them with `insmod`. You can
+build them as modules in the `linux-host/modules` directory for certain kernels
+(tested on 6.17). If the module doesn't build for your host kernel version, you
+must either port it, or install a host kernel that matches.
 
 Once you have the custom kernel installed on your host, make sure the
 appropriate kernel modules are installed:
 
 ```
 sudo modprobe -a vhost_iotlb vdpa vfio-pci
-sudo insmod linux-host/linux/drivers/vdpa/vdpa_user/vduse.ko
+sudo insmod linux-host/modules/vduse/vduse.ko
 sudo modprobe virtio_vdpa
-sudo insmod linux-host/linux/drivers/net/wireless/virtual/virtio_wlan.ko
+sudo insmod linux-host/modules/virtio_wlan/virtio_wlan.ko
 ```
 
 Build the UML:
