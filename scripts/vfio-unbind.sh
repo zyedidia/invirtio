@@ -2,8 +2,6 @@
 # Return a PCI device from vfio-pci to its native host driver.
 #
 # Reverse of vfio-bind.sh.
-#
-# SPDX-License-Identifier: GPL-2.0-or-later
 
 set -euo pipefail
 

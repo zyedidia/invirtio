@@ -2,8 +2,6 @@
 # Return a platform device from vfio-platform to its native host driver.
 #
 # Reverse of vfio-platform-bind.sh.
-#
-# SPDX-License-Identifier: GPL-2.0-or-later
 
 set -euo pipefail
 

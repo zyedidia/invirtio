@@ -3,8 +3,6 @@
 # vfio-platform.
 #
 # Reverse with vfio-platform-unbind.sh.
-#
-# SPDX-License-Identifier: GPL-2.0-or-later
 
 set -euo pipefail
 

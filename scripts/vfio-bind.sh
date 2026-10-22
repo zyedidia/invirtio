@@ -2,8 +2,6 @@
 # Detach a PCI device from its host driver and bind it to vfio-pci.
 #
 # Reverse with vfio-unbind.sh.
-#
-# SPDX-License-Identifier: GPL-2.0-or-later
 
 set -euo pipefail
 

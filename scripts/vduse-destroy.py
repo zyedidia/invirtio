@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 # Destroy a VDUSE device left behind by a driver domain that was killed
 # rather than shut down. There is no command-line tool for this ioctl.
-#
-# SPDX-License-Identifier: GPL-2.0-or-later
 
 import ctypes, errno, fcntl, os, sys
 

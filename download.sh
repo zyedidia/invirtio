@@ -1,9 +1,4 @@
 #!/bin/sh
-# Clone the two kernel trees VKage builds against.
-#
-# With --shallow the clones are a few hundred MiB instead of several GiB,
-# which is enough to build but not to develop against: a depth-1 clone has
-# no upstream history, so it cannot rebase or produce a patch series.
 
 set -eu
 
