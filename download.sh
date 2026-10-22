@@ -26,5 +26,5 @@ clone() {
 	git clone $DEPTH -b "$2" "$REPO" "$1/linux"
 }
 
-clone linux-uml  vkage-uml
-clone linux-host vkage-host
+clone linux-uml  invirtio-uml
+clone linux-host invirtio-host
