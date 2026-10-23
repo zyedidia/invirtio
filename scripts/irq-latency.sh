@@ -11,8 +11,11 @@
 #   @lat[0]  neither, so the CPU was already handling interrupts.
 #
 # @wake[1] and @wake[2] histogram the time from the host interrupt to that
-# wakeup. The counts show how often each probe fired at all, including events
-# that are not tied to a measured interrupt.
+# wakeup. @same_cpu[1] and @same_cpu[0] histogram the latency for interrupts
+# whose host handler ran on the same host CPU as the guest handler, and on a
+# different one. @irq_cpu and @guest_cpu count the host CPUs that the two
+# handlers ran on. The counts show how often each probe fired at all,
+# including events that are not tied to a measured interrupt.
 #
 # The idle path is detected on the return from sigio_idle_exit, since x86
 # uprobes cannot be placed on mark_sigio_pending, whose first instruction has
@@ -31,6 +34,8 @@ kprobe:vfio_msihandler {
 	}
 	@start = nsecs;
 	@path = 0;
+	@irq_cpu[cpu] = count();
+	@irqc = cpu;
 }
 uprobe:$BIN:sigio_idle_enter {
 	@count[\"idle wait on IRQ epoll set\"] = count();
@@ -51,9 +56,11 @@ tracepoint:syscalls:sys_enter_tgkill /args.sig == 29/ {
 }
 uprobe:$BIN:uml_vfio_interrupt {
 	@count[\"guest handler\"] = count();
+	@guest_cpu[cpu] = count();
 	if (@start) {
 		@lat[@path] = hist(nsecs - @start);
+		@same_cpu[@irqc == cpu] = hist(nsecs - @start);
 		@start = 0;
 	}
 }
-END { clear(@start); clear(@path); }"
+END { clear(@start); clear(@path); clear(@irqc); }"
