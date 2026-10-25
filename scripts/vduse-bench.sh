@@ -14,8 +14,11 @@
 #
 # Every target gets one 256-entry queue, a 1 GiB disk with 512-byte blocks
 # and the none scheduler. fio runs on host CPU FIO_CPU (default 2), and the
-# device process on DEV_CPU (default 4). Each of the seven jobs runs REPS
-# times (default 3) for RUNTIME seconds (default 5) after a 1-second ramp.
+# device process on DEV_CPU (default 4). VDUSE injects each queue's
+# interrupts from a kworker on IRQ_CPU (default 3). With IRQ_CPU empty,
+# VDUSE's default applies, which moves to the next CPU on every injection.
+# Each of the seven jobs runs REPS times (default 3) for RUNTIME seconds
+# (default 5) after a 1-second ramp.
 #
 # The output directory gets a directory per target, with fio's JSON for each
 # run, and for qsd and UML the process's user and system CPU ticks before and
@@ -25,7 +28,7 @@
 set -u
 
 if [ $# -lt 3 ]; then
-    sed -n '4,23s/^# \{0,1\}//p' "$0" >&2
+    sed -n '4,26s/^# \{0,1\}//p' "$0" >&2
     exit 2
 fi
 
@@ -37,6 +40,7 @@ UMID=vduse-bench
 MC="$ROOT/build/uml-mconsole $UMID"
 FIO_CPU=${FIO_CPU:-2}
 DEV_CPU=${DEV_CPU:-4}
+IRQ_CPU=${IRQ_CPU-3}
 REPS=${REPS:-3}
 RUNTIME=${RUNTIME:-5}
 
@@ -69,13 +73,18 @@ wait_for() {
     done
 }
 
-# Attach a VDUSE device and print its host block device.
+# Attach a VDUSE device, pin its queues' interrupt injection to IRQ_CPU,
+# and print its host block device.
 attach() {
     vdpa dev add name "$1" mgmtdev vduse || fail "vdpa dev add $1"
     wait_for "ls /sys/bus/vdpa/devices/$1/virtio*/block >/dev/null 2>&1" ||
         fail "no block device for $1"
     d=/dev/$(ls /sys/bus/vdpa/devices/$1/virtio*/block | head -1)
     wait_for "[ -b $d ]" || fail "no $d"
+    for f in /sys/class/vduse/$1/vq*/irq_cb_affinity; do
+        [ -n "$IRQ_CPU" ] && printf '%x\n' $((1 << IRQ_CPU)) > "$f"
+        echo "$f $(cat "$f")" >> "$OUT/irq_cb_affinity"
+    done
     echo "$d"
 }
 
@@ -170,7 +179,7 @@ run_uml() {
     echo "governor $(cat /sys/devices/system/cpu/cpu$DEV_CPU/cpufreq/scaling_governor)"
     echo "boost $(cat /sys/devices/system/cpu/cpufreq/boost 2>/dev/null)"
     echo "clk_tck $(getconf CLK_TCK)"
-    echo "fio_cpu $FIO_CPU dev_cpu $DEV_CPU reps $REPS runtime $RUNTIME"
+    echo "fio_cpu $FIO_CPU dev_cpu $DEV_CPU irq_cpu ${IRQ_CPU:-default} reps $REPS runtime $RUNTIME"
     fio --version
     qemu-storage-daemon --version | head -1
     git -C "$ROOT/linux-uml/linux" log -1 --format='%h %s'
