@@ -26,8 +26,8 @@ host = {}
 with open(f"{OUT}/host") as f:
     for line in f:
         p = line.split()
-        if len(p) >= 2:
-            host[p[0]] = p[1]
+        for i in range(0, len(p) - 1, 2):
+            host[p[i]] = p[i + 1]
 HZ = int(host.get("clk_tck", 100))
 REPS = int(host.get("reps", 3))
 with open(f"{OUT}/targets") as f:
