@@ -75,6 +75,24 @@ wait_for() {
     done
 }
 
+# VDUSE loops in the host kernel when it injects an interrupt on a queue
+# whose affinity holds no online CPU. virtio_vdpa spreads the queues over the
+# present CPUs, which can include offline ones, so such a queue gets every
+# online CPU instead.
+online_affinity() {
+    online=0
+    for r in $(tr , ' ' < /sys/devices/system/cpu/online); do
+        for c in $(seq "${r%-*}" "${r#*-}"); do
+            online=$((online | (1 << c)))
+        done
+    done
+    for f in /sys/class/vduse/$1/vq*/irq_cb_affinity; do
+        if [ $((0x$(tr -d , < "$f") & online)) -eq 0 ]; then
+            printf '%x\n' $online > "$f"
+        fi
+    done
+}
+
 # Attach a VDUSE device, pin its queues' interrupt injection to IRQ_CPU,
 # and print its host block device.
 attach() {
@@ -83,6 +101,7 @@ attach() {
         fail "no block device for $1"
     d=/dev/$(ls /sys/bus/vdpa/devices/$1/virtio*/block | head -1)
     wait_for "[ -b $d ]" || fail "no $d"
+    online_affinity "$1"
     for f in /sys/class/vduse/$1/vq*/irq_cb_affinity; do
         [ -n "$IRQ_CPU" ] && printf '%x\n' $((1 << IRQ_CPU)) > "$f"
         echo "$f $(cat "$f")" >> "$OUT/irq_cb_affinity"
