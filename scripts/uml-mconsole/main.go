@@ -56,15 +56,10 @@ func socketPath(target string) (string, error) {
 // request sends cmd to the console at path and returns the reply text and the
 // error flag of the first reply.
 func request(path, cmd string) (string, uint32, error) {
-	// The guest replies to the sender's address, so the client socket needs
-	// a path of its own.
-	dir, err := os.MkdirTemp("", "uml-mconsole")
-	if err != nil {
-		return "", 0, err
-	}
-	defer os.RemoveAll(dir)
-
-	laddr := &net.UnixAddr{Name: filepath.Join(dir, "client"), Net: "unixgram"}
+	// The guest replies to the sender's address. An abstract address has no
+	// file permissions, so a guest running as another user can reply to it.
+	name := fmt.Sprintf("@uml-mconsole-%d-%d", os.Getpid(), time.Now().UnixNano())
+	laddr := &net.UnixAddr{Name: name, Net: "unixgram"}
 	raddr := &net.UnixAddr{Name: path, Net: "unixgram"}
 	conn, err := net.DialUnix("unixgram", laddr, raddr)
 	if err != nil {
