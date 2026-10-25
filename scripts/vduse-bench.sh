@@ -105,18 +105,18 @@ run_jobs() {
             "seqwrite-128k write 128k 8" \
             "seqwrite-1m write 1m 8"; do
             set -- $job
-            name=$1-$rep
-            [ "$counters" = yes ] && $MC proc vduse_uml > "$dir/$name.before"
+            run=$1-$rep
+            [ "$counters" = yes ] && $MC proc vduse_uml > "$dir/$run.before"
             [ -n "$pid" ] && t0=$(cputicks $pid)
             taskset -c $FIO_CPU fio --name="$1" --filename="$dev" \
                 --rw="$2" --bs="$3" --iodepth="$4" \
                 --direct=1 --ioengine=io_uring --time_based \
                 --runtime=$RUNTIME --ramp_time=1 --norandommap \
                 --randrepeat=0 --output-format=json \
-                --output="$dir/$name.json" >/dev/null ||
-                fail "fio $target $name"
-            [ -n "$pid" ] && echo "$t0 $(cputicks $pid)" > "$dir/$name.ticks"
-            [ "$counters" = yes ] && $MC proc vduse_uml > "$dir/$name.after"
+                --output="$dir/$run.json" >/dev/null ||
+                fail "fio $target $run"
+            [ -n "$pid" ] && echo "$t0 $(cputicks $pid)" > "$dir/$run.ticks"
+            [ "$counters" = yes ] && $MC proc vduse_uml > "$dir/$run.after"
         done
     done
 }
@@ -173,6 +173,8 @@ run_uml() {
     fio --version
     qemu-storage-daemon --version | head -1
     git -C "$ROOT/linux-uml/linux" log -1 --format='%h %s'
+    git -C "$ROOT/linux-uml/linux" diff --quiet HEAD ||
+        echo "uncommitted changes in linux-uml/linux"
 } > "$OUT/host"
 
 modprobe -a vduse vdpa virtio_vdpa virtio_blk || fail modprobe
