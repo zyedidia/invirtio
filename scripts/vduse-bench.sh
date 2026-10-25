@@ -148,7 +148,7 @@ run_uml() {
     "$2/linux" umid=$UMID mem=512M cpu_pin=$DEV_CPU initrd="$INITRD" \
         null_blk.nr_devices=1 null_blk.gb=1 null_blk.hw_queue_depth=256 \
         null_blk.submit_queues=1 null_blk.memory_backed=0 \
-        vduse_uml.device=blk,vuml,disk=/dev/nullb0 \
+        vduse_uml.device=blk,vuml,disk=/dev/nullb0,log="$OUT/$1.inflight" \
         </dev/null >"$OUT/$1.guest.log" 2>&1 &
     PID=$!
     wait_for "[ -e /dev/vduse/vuml ]" || fail "no /dev/vduse/vuml"
@@ -162,6 +162,7 @@ run_uml() {
     PID=
     sleep 1
     python3 "$ROOT/scripts/vduse-destroy.py" vuml
+    rm -f "$OUT/$1.inflight"
 }
 
 {
