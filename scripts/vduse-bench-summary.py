@@ -16,7 +16,8 @@ import sys
 JOBS = ["lat-qd1", "iops-qd32", "iops-qd128", "seqread-128k", "seqread-1m",
         "seqwrite-128k", "seqwrite-1m"]
 COUNTERS = ["kicks", "kick_irqs", "requests", "injected", "suppressed",
-            "bad_requests", "inject_errors", "dropped_kicks"]
+            "bad_requests", "inject_errors", "dropped_kicks", "polled",
+            "poll_timeouts"]
 
 if len(sys.argv) != 2:
     sys.exit(f"usage: {os.path.basename(sys.argv[0])} <output dir>")
@@ -107,6 +108,7 @@ for t in TARGETS:
         for rep in range(1, REPS + 1):
             a = queue_counters(f"{OUT}/{t}/{job}-{rep}.after")
             b = queue_counters(f"{OUT}/{t}/{job}-{rep}.before")
-            rows.append({k: a[k] - b[k] for k in COUNTERS})
+            # Guests from before a counter existed report it as 0.
+            rows.append({k: a.get(k, 0) - b.get(k, 0) for k in COUNTERS})
         print(f"  {job:14s} " +
               " ".join(f"{med([r[c] for r in rows]):13.0f}" for c in COUNTERS))
