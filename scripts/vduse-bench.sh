@@ -8,9 +8,11 @@
 #   native             null_blk on the host;
 #   qsd                qemu-storage-daemon exporting a null-co node with its
 #                      vduse-blk export;
-#   uml:<name>:<path>  a UML guest from the build directory <path>, exporting
+#   uml:<name>:<path>[:<options>]
+#                      a UML guest from the build directory <path>, exporting
 #                      its own null_blk through vduse_uml. <name> names the
-#                      results.
+#                      results, and <options> are added to the device's,
+#                      for example bounce=guest.
 #
 # Every target gets one 256-entry queue, a 1 GiB disk with 512-byte blocks
 # and the none scheduler. fio runs on host CPU FIO_CPU (default 2), and the
@@ -28,7 +30,7 @@
 set -u
 
 if [ $# -lt 3 ]; then
-    sed -n '4,26s/^# \{0,1\}//p' "$0" >&2
+    sed -n '4,28s/^# \{0,1\}//p' "$0" >&2
     exit 2
 fi
 
@@ -154,10 +156,12 @@ run_qsd() {
 }
 
 run_uml() {
+    # VDUSE counts bounce=guest's guest pages against RLIMIT_MEMLOCK.
+    ulimit -l unlimited
     "$2/linux" umid=$UMID mem=512M cpu_pin=$DEV_CPU initrd="$INITRD" \
         null_blk.nr_devices=1 null_blk.gb=1 null_blk.hw_queue_depth=256 \
         null_blk.submit_queues=1 null_blk.memory_backed=0 \
-        vduse_uml.device=blk,vuml,disk=/dev/nullb0,log="$OUT/$1.inflight" \
+        vduse_uml.device=blk,vuml,disk=/dev/nullb0,log="$OUT/$1.inflight"${3:+,$3} \
         </dev/null >"$OUT/$1.guest.log" 2>&1 &
     PID=$!
     wait_for "[ -e /dev/vduse/vuml ]" || fail "no /dev/vduse/vuml"
@@ -203,9 +207,13 @@ for t in "$@"; do
         echo qsd >> "$OUT/targets"
         ;;
     uml:*:*)
-        name=${t#uml:}
-        name=${name%%:*}
-        run_uml "$name" "$(realpath "${t#uml:*:}")"
+        rest=${t#uml:}
+        name=${rest%%:*}
+        rest=${rest#*:}
+        path=${rest%%:*}
+        opts=
+        [ "$rest" != "$path" ] && opts=${rest#*:}
+        run_uml "$name" "$(realpath "$path")" "$opts"
         echo "$name" >> "$OUT/targets"
         ;;
     *)
