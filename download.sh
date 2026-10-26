@@ -2,7 +2,8 @@
 
 set -eu
 
-REPO=https://github.com/zyedidia/linux
+LINUX=https://github.com/zyedidia/linux
+CH=https://github.com/zyedidia/cloud-hypervisor
 DEPTH=
 
 usage() {
@@ -19,12 +20,13 @@ for arg; do
 done
 
 clone() {
-	if [ -d "$1/linux" ]; then
-		echo "$1/linux already exists, skipping"
+	if [ -d "$1" ]; then
+		echo "$1 already exists, skipping"
 		return
 	fi
-	git clone $DEPTH -b "$2" "$REPO" "$1/linux"
+	git clone $DEPTH -b "$3" "$2" "$1"
 }
 
-clone linux-uml  invirtio-uml
-clone linux-host invirtio-host
+clone linux-uml/linux       "$LINUX" invirtio-uml
+clone linux-host/linux      "$LINUX" invirtio-host
+clone kvm/cloud-hypervisor  "$CH"    invirtio

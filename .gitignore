@@ -3,3 +3,4 @@ build*
 data
 linux-host/linux
 linux-uml/linux
+kvm/cloud-hypervisor

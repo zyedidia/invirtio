@@ -9,7 +9,8 @@ Linux device drivers running in userspace.
   are contained to kernel modules so they can be reloaded without rebooting the
   host kernel (after installing a custom kernel in the host).
 
-Run `./download.sh --shallow` to download the two Linux kernels.
+Run `./download.sh --shallow` to download the two Linux kernels and the Cloud
+Hypervisor fork used by the KVM prototype (`docs/KVM.md`).
 
 ## Example: NVMe driver
 
