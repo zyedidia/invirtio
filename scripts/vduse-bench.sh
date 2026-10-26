@@ -13,6 +13,12 @@
 #                      its own null_blk through vduse_guest. <name> names the
 #                      results, and <options> are added to the device's,
 #                      for example bounce=guest.
+#   kvm:<name>:<path>[:<options>[:<proxy options>]]
+#                      an x86-64 guest from the build directory <path> under
+#                      Cloud Hypervisor ($CH, by default the release build in
+#                      kvm/cloud-hypervisor), exporting its own null_blk
+#                      through a VDUSE proxy. <proxy options> are added to
+#                      --vduse-proxy, for example inject=thread.
 #
 # Every target gets one 256-entry queue, a 1 GiB disk with 512-byte blocks
 # and the none scheduler. fio runs on host CPU FIO_CPU (default 2), and the
@@ -23,14 +29,16 @@
 # (default 5) after a 1-second ramp.
 #
 # The output directory gets a directory per target, with fio's JSON for each
-# run, and for qsd and UML the process's user and system CPU ticks before and
-# after the run (<job>-<rep>.ticks). UML targets also get /proc/vduse_guest
-# before and after each run. vduse-bench-summary.py prints the results.
+# run, and for qsd, UML and KVM the process's user and system CPU ticks
+# before and after the run (<job>-<rep>.ticks). For KVM the process is the
+# VMM, whose time includes the guest's. UML targets also get
+# /proc/vduse_guest before and after each run. vduse-bench-summary.py prints
+# the results.
 
 set -u
 
 if [ $# -lt 3 ]; then
-    sed -n '4,28s/^# \{0,1\}//p' "$0" >&2
+    sed -n '4,37s/^# \{0,1\}//p' "$0" >&2
     exit 2
 fi
 
@@ -45,6 +53,9 @@ DEV_CPU=${DEV_CPU:-4}
 IRQ_CPU=${IRQ_CPU-3}
 REPS=${REPS:-3}
 RUNTIME=${RUNTIME:-5}
+CH=${CH:-$ROOT/kvm/cloud-hypervisor/target/release/cloud-hypervisor}
+NULL_BLK="null_blk.nr_devices=1 null_blk.gb=1 null_blk.hw_queue_depth=256
+null_blk.submit_queues=1 null_blk.memory_backed=0"
 
 mkdir -p "$OUT"
 OUT=$(realpath "$OUT")
@@ -57,11 +68,13 @@ fail() {
 cleanup() {
     vdpa dev del vqsd 2>/dev/null
     vdpa dev del vuml 2>/dev/null
+    vdpa dev del vkvm 2>/dev/null
     [ -n "${QSD:-}" ] && kill "$QSD" 2>/dev/null
     [ -n "${PID:-}" ] && kill -9 "$PID" 2>/dev/null
     sleep 1
     python3 "$ROOT/scripts/vduse-destroy.py" vqsd 2>/dev/null
     python3 "$ROOT/scripts/vduse-destroy.py" vuml 2>/dev/null
+    python3 "$ROOT/scripts/vduse-destroy.py" vkvm 2>/dev/null
     modprobe -r null_blk 2>/dev/null
 }
 trap cleanup EXIT
@@ -107,6 +120,14 @@ attach() {
         echo "$f $(cat "$f")" >> "$OUT/irq_cb_affinity"
     done
     echo "$d"
+}
+
+# Fail if a device of this name is left from another process, which the
+# guest would otherwise reconnect to or the benchmark would measure.
+check_free() {
+    [ -e /dev/vduse/$1 ] &&
+        fail "/dev/vduse/$1 is still in use, perhaps by a guest of an earlier run"
+    return 0
 }
 
 # Print the user and system CPU ticks of a process.
@@ -175,11 +196,11 @@ run_qsd() {
 }
 
 run_uml() {
+    check_free vuml
     # VDUSE counts bounce=guest's guest pages against RLIMIT_MEMLOCK.
     ulimit -l unlimited
     "$2/linux" umid=$UMID mem=512M cpu_pin=$DEV_CPU initrd="$INITRD" \
-        null_blk.nr_devices=1 null_blk.gb=1 null_blk.hw_queue_depth=256 \
-        null_blk.submit_queues=1 null_blk.memory_backed=0 \
+        $NULL_BLK \
         vduse_guest.device=blk,vuml,disk=/dev/nullb0,log="$OUT/$1.inflight"${3:+,$3} \
         </dev/null >"$OUT/$1.guest.log" 2>&1 &
     PID=$!
@@ -197,6 +218,32 @@ run_uml() {
     rm -f "$OUT/$1.inflight"
 }
 
+# The VMM's threads share the guest's host CPU, as UML's helpers do. Cloud
+# Hypervisor needs --seccomp false for the VDUSE proxy's ioctls.
+run_kvm() {
+    check_free vkvm
+    ulimit -l unlimited
+    taskset -c $DEV_CPU "$CH" --kernel "$2/arch/x86/boot/bzImage" \
+        --initramfs "$INITRD" \
+        --cmdline "console=ttyS0 $(echo $NULL_BLK) vduse_guest.device=blk,vkvm,disk=/dev/nullb0${3:+,$3}" \
+        --cpus "boot=1,affinity=[0@[$DEV_CPU]]" --memory size=512M,shared=on \
+        --serial file="$OUT/$1.guest.log" --console off --seccomp false \
+        --vduse-proxy name=vkvm${4:+,$4} \
+        </dev/null >"$OUT/$1.vmm.log" 2>&1 &
+    PID=$!
+    wait_for "[ -e /dev/vduse/vkvm ]" || fail "no /dev/vduse/vkvm"
+    dev=$(attach vkvm)
+    grep -E "^CONFIG_(SMP|LOCKDEP|PROVE_LOCKING|PREEMPT_LAZY|HZ)=" \
+        "$2/.config" > "$OUT/$1.config"
+    run_jobs "$1" "$dev" no $PID
+    vdpa dev del vkvm
+    kill -9 $PID
+    wait $PID 2>/dev/null
+    PID=
+    sleep 1
+    python3 "$ROOT/scripts/vduse-destroy.py" vkvm
+}
+
 {
     uname -a
     echo "governor $(cat /sys/devices/system/cpu/cpu$DEV_CPU/cpufreq/scaling_governor)"
@@ -208,11 +255,15 @@ run_uml() {
     git -C "$ROOT/linux-uml/linux" log -1 --format='%h %s'
     git -C "$ROOT/linux-uml/linux" diff --quiet HEAD ||
         echo "uncommitted changes in linux-uml/linux"
+    git -C "$ROOT/kvm/cloud-hypervisor" log -1 --format='%h %s'
+    echo "halt_poll_ns $(cat /sys/module/kvm/parameters/halt_poll_ns 2>/dev/null)"
+    echo "avic $(cat /sys/module/kvm_amd/parameters/avic 2>/dev/null)"
 } > "$OUT/host"
 
 modprobe -a vduse vdpa virtio_vdpa virtio_blk || fail modprobe
 python3 "$ROOT/scripts/vduse-destroy.py" vqsd 2>/dev/null
 python3 "$ROOT/scripts/vduse-destroy.py" vuml 2>/dev/null
+python3 "$ROOT/scripts/vduse-destroy.py" vkvm 2>/dev/null
 
 : > "$OUT/targets"
 for t in "$@"; do
@@ -233,6 +284,21 @@ for t in "$@"; do
         opts=
         [ "$rest" != "$path" ] && opts=${rest#*:}
         run_uml "$name" "$(realpath "$path")" "$opts"
+        echo "$name" >> "$OUT/targets"
+        ;;
+    kvm:*:*)
+        rest=${t#kvm:}
+        name=${rest%%:*}
+        rest=${rest#*:}
+        path=${rest%%:*}
+        opts=
+        proxy=
+        if [ "$rest" != "$path" ]; then
+            rest=${rest#*:}
+            opts=${rest%%:*}
+            [ "$rest" != "$opts" ] && proxy=${rest#*:}
+        fi
+        run_kvm "$name" "$(realpath "$path")" "$opts" "$proxy"
         echo "$name" >> "$OUT/targets"
         ;;
     *)
