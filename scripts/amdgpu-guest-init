@@ -1,0 +1,42 @@
+#!/bin/sh
+# The init script of an amdgpu guest, for mkinitramfs.sh -i. It reports
+# whether amdgpu probed, which firmware it could not load and the results of
+# its ring tests, then powers off. With init_shell on the kernel command
+# line, it starts a shell instead of powering off.
+
+export PATH=/sbin:/usr/sbin:/bin:/usr/bin
+mount -t devtmpfs devtmpfs /dev
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t debugfs debugfs /sys/kernel/debug
+
+echo "=== missing firmware"
+dmesg | grep 'Direct firmware load' || echo "none"
+
+echo "=== pci drivers"
+ls /sys/bus/pci/drivers
+
+echo "=== pci devices"
+for d in /sys/bus/pci/devices/*; do
+	[ -e "$d" ] || continue
+	echo "$d $(cat "$d/vendor"):$(cat "$d/device")" \
+	     "driver=$(basename "$(readlink "$d/driver")" 2>/dev/null)"
+done
+
+echo "=== /proc/vfio_uml"
+cat /proc/vfio_uml
+
+for d in /sys/kernel/debug/dri/*; do
+	[ -e "$d/amdgpu_firmware_info" ] || continue
+	echo "=== $d firmware"
+	cat "$d/amdgpu_firmware_info"
+	echo "=== $d ring tests"
+	cat "$d/amdgpu_test_ib"
+done
+
+case " $(cat /proc/cmdline) " in
+*" init_shell "*)
+	exec sh
+	;;
+esac
+poweroff -f
