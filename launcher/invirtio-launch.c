@@ -38,8 +38,11 @@
 
 struct device {
 	const char *addr;
+	/* The expansion ROM image to give the guest, or NULL. */
+	const char *rom_path;
 	int group_id;
 	int group_fd;
+	int rom_fd;
 };
 
 static const char *prog = "invirtio-launch";
@@ -66,14 +69,16 @@ static void usage(void)
 "usage: %s [options] <uml binary> [uml arguments...]\n"
 "\n"
 "Run a UML driver guest as an unprivileged user. The launcher opens the\n"
-"VFIO container and groups, the initramfs, /proc/cpuinfo and the mconsole\n"
-"socket, and passes them to UML as file descriptors, along with the memfd\n"
-"and no_uml_dir options. The guest's console is the launcher's stdin and\n"
-"stdout.\n"
+"VFIO container and groups, any ROM images, the initramfs, /proc/cpuinfo\n"
+"and the mconsole socket, and passes them to UML as file descriptors, along\n"
+"with the memfd and no_uml_dir options. The guest's console is the\n"
+"launcher's stdin and stdout.\n"
 "\n"
 "  -u <user>     run the guest as this user, given as a name or uid[:gid]\n"
-"  -d <address>  pass through this PCI device, such as 0000:06:00.0. Can be\n"
-"                repeated\n"
+"  -d <address>[,rom=<file>]\n"
+"                pass through this PCI device, such as 0000:06:00.0. With\n"
+"                rom, the guest sees the image in <file> as the device's\n"
+"                expansion ROM. Can be repeated\n"
 "  -b            bind the devices to vfio-pci if they are not bound to it\n"
 "  -i <file>     the initramfs, passed as initrd=fd:<n>\n"
 "  -l <MiB>      the guest's RLIMIT_MEMLOCK, which bounds pinned DMA memory\n"
@@ -346,6 +351,9 @@ static void open_guest_fds(struct guest_fds *fds)
 	for (i = 0; i < nr_devices; i++) {
 		char path[64];
 
+		devices[i].rom_fd = devices[i].rom_path ?
+			open_fd(devices[i].rom_path, O_RDONLY) : -1;
+
 		devices[i].group_fd = -1;
 		for (j = 0; j < i; j++) {
 			if (devices[j].group_id == devices[i].group_id)
@@ -377,6 +385,8 @@ static void close_guest_fds(struct guest_fds *fds)
 
 	close(fds->container);
 	for (i = 0; i < nr_devices; i++) {
+		if (devices[i].rom_fd >= 0)
+			close(devices[i].rom_fd);
 		for (j = 0; j < i; j++) {
 			if (devices[j].group_fd == devices[i].group_fd)
 				break;
@@ -425,9 +435,15 @@ static char **guest_argv(int argc, char **argv, struct guest_fds *fds)
 		args[n++] = format("mconsole=fd:%d", fds->mconsole);
 	if (nr_devices)
 		args[n++] = format("vfio_uml.container_fd=%d", fds->container);
-	for (i = 0; i < nr_devices; i++)
-		args[n++] = format("vfio_uml.device=%s,group_fd=%d",
-				   devices[i].addr, devices[i].group_fd);
+	for (i = 0; i < nr_devices; i++) {
+		if (devices[i].rom_fd >= 0)
+			args[n++] = format("vfio_uml.device=%s,group_fd=%d,rom_fd=%d",
+					   devices[i].addr, devices[i].group_fd,
+					   devices[i].rom_fd);
+		else
+			args[n++] = format("vfio_uml.device=%s,group_fd=%d",
+					   devices[i].addr, devices[i].group_fd);
+	}
 	for (i = 1; i < argc; i++)
 		args[n++] = argv[i];
 	args[n] = NULL;
@@ -699,7 +715,15 @@ int main(int argc, char **argv)
 			if (nr_devices == MAX_DEVICES)
 				die("at most %d devices are supported",
 				    MAX_DEVICES);
-			devices[nr_devices++].addr = optarg;
+			devices[nr_devices].addr = optarg;
+			end = strchr(optarg, ',');
+			if (end) {
+				*end++ = '\0';
+				if (strncmp(end, "rom=", 4) || !end[4])
+					die("cannot parse -d option '%s'", end);
+				devices[nr_devices].rom_path = end + 4;
+			}
+			nr_devices++;
 			break;
 		case 'b':
 			bind_devices = true;
