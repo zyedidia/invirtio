@@ -10,7 +10,7 @@
 #                      vduse-blk export;
 #   uml:<name>:<path>[:<options>]
 #                      a UML guest from the build directory <path>, exporting
-#                      its own null_blk through vduse_uml. <name> names the
+#                      its own null_blk through vduse_guest. <name> names the
 #                      results, and <options> are added to the device's,
 #                      for example bounce=guest.
 #
@@ -24,7 +24,7 @@
 #
 # The output directory gets a directory per target, with fio's JSON for each
 # run, and for qsd and UML the process's user and system CPU ticks before and
-# after the run (<job>-<rep>.ticks). UML targets also get /proc/vduse_uml
+# after the run (<job>-<rep>.ticks). UML targets also get /proc/vduse_guest
 # before and after each run. vduse-bench-summary.py prints the results.
 
 set -u
@@ -114,7 +114,7 @@ cputicks() {
     awk '{ print $14, $15 }' /proc/$1/stat
 }
 
-# Run every job against a device. A UML target saves /proc/vduse_uml, and a
+# Run every job against a device. A UML target saves /proc/vduse_guest, and a
 # target with a device process saves that process's CPU time.
 run_jobs() {
     target=$1
@@ -136,7 +136,7 @@ run_jobs() {
             "seqwrite-1m write 1m 8"; do
             set -- $job
             run=$1-$rep
-            [ "$counters" = yes ] && $MC proc vduse_uml > "$dir/$run.before"
+            [ "$counters" = yes ] && $MC proc vduse_guest > "$dir/$run.before"
             [ -n "$pid" ] && t0=$(cputicks $pid)
             taskset -c $FIO_CPU fio --name="$1" --filename="$dev" \
                 --rw="$2" --bs="$3" --iodepth="$4" \
@@ -146,7 +146,7 @@ run_jobs() {
                 --output="$dir/$run.json" >/dev/null ||
                 fail "fio $target $run"
             [ -n "$pid" ] && echo "$t0 $(cputicks $pid)" > "$dir/$run.ticks"
-            [ "$counters" = yes ] && $MC proc vduse_uml > "$dir/$run.after"
+            [ "$counters" = yes ] && $MC proc vduse_guest > "$dir/$run.after"
         done
     done
 }
@@ -180,7 +180,7 @@ run_uml() {
     "$2/linux" umid=$UMID mem=512M cpu_pin=$DEV_CPU initrd="$INITRD" \
         null_blk.nr_devices=1 null_blk.gb=1 null_blk.hw_queue_depth=256 \
         null_blk.submit_queues=1 null_blk.memory_backed=0 \
-        vduse_uml.device=blk,vuml,disk=/dev/nullb0,log="$OUT/$1.inflight"${3:+,$3} \
+        vduse_guest.device=blk,vuml,disk=/dev/nullb0,log="$OUT/$1.inflight"${3:+,$3} \
         </dev/null >"$OUT/$1.guest.log" 2>&1 &
     PID=$!
     wait_for "[ -e /dev/vduse/vuml ]" || fail "no /dev/vduse/vuml"

@@ -6,7 +6,7 @@
 # For each job and target, it prints the median over the repetitions of the
 # IOPS, bandwidth, mean latency and clat percentiles, the spread of the IOPS,
 # and the device process's CPU time per I/O. For UML targets it then prints
-# the vduse_uml counters of each job.
+# the vduse_guest counters of each job.
 
 import json
 import os
@@ -41,7 +41,7 @@ def load(target, job, rep):
     return (j["read"] if j["read"]["io_bytes"] else j["write"]), j
 
 
-# Return the counters of queue 0 in a /proc/vduse_uml dump.
+# Return the counters of queue 0 in a /proc/vduse_guest dump.
 def queue_counters(path):
     out = {}
     queue = None
