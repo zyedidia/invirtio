@@ -1,12 +1,18 @@
 #!/bin/sh
-# Test a UML guest's VDUSE block device for correctness and across the
-# guest's lifecycle (V2 and V8 in docs/VDUSE.md). Run as root.
+# Test a guest's VDUSE block device for correctness and across the guest's
+# lifecycle (V2 and V8 in docs/VDUSE.md). Run as root.
 #
-# usage: vduse-test.sh <output dir> <initramfs> <UML build dir> [<test>...]
+# usage: vduse-test.sh <output dir> <initramfs> <guest> [<test>...]
 #
-# The guest serves a 256 MiB ubd disk backed by a file in the output
-# directory, so that its data survives relaunches. The tests run in this
-# order, all of them by default:
+# The guest is a UML build directory, or kvm:<build dir>[:<proxy options>]
+# for an x86-64 guest under Cloud Hypervisor with a VDUSE proxy, such as
+# kvm:linux-uml/build-kvm:inject=thread. The VMM is $CH, by default the
+# release build in kvm/cloud-hypervisor.
+#
+# A UML guest serves a 256 MiB ubd disk backed by a file in the output
+# directory, so that its data survives relaunches. A KVM guest serves a
+# 256 MiB brd disk, and runs only the io and rebind tests by default, since
+# it cannot reconnect. A UML guest runs every test by default. In order:
 #   io       fio with verify=crc32c over the whole disk, then mkfs.ext4, a
 #            mount, a copy and a checksum after the page cache is dropped;
 #   rebind   unbinding virtio_blk and binding it again, then vdpa dev del
@@ -29,7 +35,7 @@
 set -u
 
 if [ $# -lt 3 ]; then
-    sed -n '4,26s/^# \{0,1\}//p' "$0" >&2
+    sed -n '4,32s/^# \{0,1\}//p' "$0" >&2
     exit 2
 fi
 
@@ -37,9 +43,24 @@ ROOT=$(realpath "$(dirname "$0")/..")
 mkdir -p "$1"
 OUT=$(realpath "$1")
 INITRD=$(realpath "$2")
-BUILD=$(realpath "$3")
+case $3 in
+kvm:*)
+    KVM=yes
+    rest=${3#kvm:}
+    BUILD=$(realpath "${rest%%:*}")
+    PROXY=
+    [ "$rest" != "${rest%%:*}" ] && PROXY=,${rest#*:}
+    ALL="io rebind"
+    ;;
+*)
+    KVM=
+    BUILD=$(realpath "$3")
+    ALL="io rebind stop kill term unused timeout"
+    ;;
+esac
 shift 3
-TESTS=${*:-io rebind stop kill term unused timeout}
+TESTS=${*:-$ALL}
+CH=${CH:-$ROOT/kvm/cloud-hypervisor/target/release/cloud-hypervisor}
 
 NAME=vtest
 UMID=vduse-test
@@ -76,10 +97,20 @@ wait_for() {
 start() {
     N=$((N + 1))
     GLOG=$OUT/guest-$N.log
-    "$BUILD/linux" umid=$UMID mem=512M initrd="$INITRD" ubd0="$DISK" \
-        vduse_guest.device=blk,$NAME,disk=/dev/ubda,log="$LOG" \
-        </dev/null >"$GLOG" 2>&1 &
+    if [ -n "$KVM" ]; then
+        "$CH" --kernel "$BUILD/arch/x86/boot/bzImage" --initramfs "$INITRD" \
+            --cmdline "console=ttyS0 brd.rd_nr=1 brd.rd_size=262144 vduse_guest.device=blk,$NAME,disk=/dev/ram0" \
+            --cpus boot=1 --memory size=1G,shared=on --serial file="$GLOG" \
+            --console off --seccomp false --vduse-proxy name=$NAME$PROXY \
+            </dev/null >"$OUT/vmm-$N.log" 2>&1 &
+    else
+        "$BUILD/linux" umid=$UMID mem=512M initrd="$INITRD" ubd0="$DISK" \
+            vduse_guest.device=blk,$NAME,disk=/dev/ubda,log="$LOG" \
+            </dev/null >"$GLOG" 2>&1 &
+    fi
     PID=$!
+    # Cloud Hypervisor creates the console file readable by root only.
+    [ -n "$KVM" ] && wait_for "[ -e $GLOG ]" && chmod a+r "$GLOG"
     wait_for "grep -q '$NAME: \(created\|reconnecting\|the device stopped\)' $GLOG" ||
         fail "guest $N did not reach the device"
 }
@@ -217,6 +248,10 @@ truncate -s 256M "$DISK"
 head -c 64M /dev/urandom > "$DATA"
 
 for t in $TESTS; do
+    case " $ALL " in
+    *" $t "*) ;;
+    *) fail "this guest cannot run the $t test" ;;
+    esac
     echo "== $t"
     "t_$t"
 done
