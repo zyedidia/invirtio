@@ -3,4 +3,7 @@ build*
 data
 linux-host/linux
 linux-uml/linux
+references
+PATCH.md
+CLAUDE.md
 kvm/cloud-hypervisor
