@@ -1,19 +1,23 @@
 #!/usr/bin/env python3
 # Test the host's virtio_wlan driver against the UML mac80211_hwsim guest of
-# docs/VIRTIO_WIFI.md (stage 1, probe). Run as root, with the vduse module of
-# linux-host/modules loaded.
+# docs/VIRTIO_WIFI.md (stages 1 and 2, and an open network). Run as root,
+# with the vduse module of linux-host/modules loaded.
 #
 # usage: vduse-wlan-test.py <guest build dir> <initramfs> <output dir>
 #
 # The script loads linux-host/modules/virtio_wlan.ko in place of any loaded
-# copy, boots the guest, and attaches its device to virtio_vdpa. It checks
-# that the host's wiphy has the guest's bands, channels, capabilities and
-# ciphers, that bringing the host's interface up and down does the same to
-# the guest's wlan0, and that the driver's counters are zero. It then removes
-# the device and attaches it again, kills the guest, and checks that a
-# command times out and that the device can still be removed. It also checks
-# that neither kernel logs a warning. The guest's console goes to guest.log in
-# the output directory.
+# copy, sets the host's country to DE for the 6 GHz band, boots the guest,
+# and attaches its device to virtio_vdpa. It checks that the host's wiphy has
+# the guest's bands, channels, capabilities and ciphers, and that bringing
+# the host's interface up and down does the same to the guest's wlan0. It
+# then scans and checks that every network of the guest is found on its band,
+# connects to the open networks on 2.4 and 5 GHz, checks the station and
+# disconnects, checks that a missing network fails, and checks that the
+# driver's counters are zero. It removes the device while connected and
+# attaches it again, kills the guest, and checks that a command times out and
+# that the device can still be removed. It also checks that neither kernel
+# logs a warning, and restores the host's country. The guest's console goes
+# to guest.log in the output directory.
 
 import glob
 import os
@@ -24,6 +28,13 @@ import sys
 import time
 
 NAME = "vwlan-test"
+COUNTRY = "DE"
+NETWORKS = {f"hwsim-{band}-{kind}" for band in ("2g", "5g")
+            for kind in ("open", "wpa2", "wpa2-mfp", "wpa3-transition")}
+NETWORKS.add("hwsim-6g-wpa3")
+COUNTERS = ["cmd_timeouts", "bad_responses", "bad_events", "stale_events",
+            "bad_bss", "bad_connect_results", "bad_rates", "scan_timeouts",
+            "connect_timeouts"]
 MODULE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                       "../linux-host/modules/virtio_wlan.ko")
 
@@ -159,6 +170,136 @@ def counter(phy, name):
         return None
 
 
+def counters(phy):
+    return {name: counter(phy, name) for name in COUNTERS}
+
+
+def band_of(freq):
+    return "2g" if freq < 3000 else "5g" if freq < 5935 else "6g"
+
+
+def scan(net):
+    """Return the SSID and frequency of each BSS that a scan finds."""
+    r = run("timeout", "40", "iw", "dev", net, "scan")
+    found = {}
+    bss = None
+    for line in r.stdout.splitlines():
+        m = re.match(r"BSS ([0-9a-f:]{17})", line)
+        if m:
+            bss = found.setdefault(m.group(1), {})
+        m = re.match(r"\s+freq: (\d+)", line)
+        if m and bss is not None:
+            bss["freq"] = int(m.group(1))
+        m = re.match(r"\s+SSID: (.*)", line)
+        if m and bss is not None:
+            bss["ssid"] = m.group(1)
+    return found
+
+
+def global_regdom():
+    out = run("iw", "reg", "get").stdout
+    return out[:out.find("\n\n")] if out.startswith("global") else ""
+
+
+def get_country():
+    """Return the global country, if it is one that can be set again."""
+    m = re.match(r"global\ncountry ([A-Z]{2}|00):", global_regdom())
+    return m.group(1) if m else None
+
+
+def allow_6ghz():
+    """Set the country, and wait until the global domain permits 6 GHz. An
+    intersection with another hint shows as country 98."""
+    run("iw", "reg", "set", COUNTRY)
+    for _ in range(50):
+        if "(5945 - " in global_regdom():
+            return True
+        time.sleep(0.1)
+    return False
+
+
+class Events:
+    """The output of iw event for the duration of a test."""
+
+    def __init__(self):
+        self.proc = subprocess.Popen(["iw", "event"], stdout=subprocess.PIPE)
+        self.fd = self.proc.stdout.fileno()
+        os.set_blocking(self.fd, False)
+        self.text = ""
+
+    def wait_for(self, pattern, timeout):
+        end = time.time() + timeout
+        while time.time() < end:
+            try:
+                self.text += os.read(self.fd, 65536).decode(errors="replace")
+            except BlockingIOError:
+                pass
+            m = re.search(pattern, self.text)
+            if m:
+                self.text = self.text[m.end():]
+                return m
+            time.sleep(0.1)
+        return None
+
+    def close(self):
+        self.proc.kill()
+        self.proc.wait()
+
+
+def test_connect(events, net, ssid):
+    run("iw", "dev", net, "connect", ssid, check=True)
+    m = events.wait_for(rf"{net} \(phy #\d+\): (connected to|failed to "
+                        rf"connect|timed out)[^\n]*", 40)
+    return m.group(0) if m else "no connection event"
+
+
+def test_scan_connect(phy, net):
+    """Scan all three bands, then connect to open networks and leave the
+    last connection up. Return the number of disconnections that the host
+    asked for."""
+    r = run("ip", "link", "set", net, "up")
+    if not check(r.returncode == 0, f"{net} comes up"):
+        return 0
+    found = scan(net)
+    ssids = {b.get("ssid") for b in found.values()}
+    check(NETWORKS <= ssids,
+          f"a scan finds the guest's networks: missing "
+          f"{sorted(NETWORKS - ssids)}")
+    check(all(b.get("ssid", "hwsim-").startswith("hwsim-") and
+              band_of(b.get("freq", 0)) == b["ssid"].split("-")[1]
+              for b in found.values() if b.get("ssid") in NETWORKS),
+          "each network is on its band")
+
+    events = Events()
+    disconnects = 0
+    try:
+        for ssid in ("hwsim-2g-open", "hwsim-5g-open"):
+            result = test_connect(events, net, ssid)
+            link = run("iw", "dev", net, "link").stdout
+            check(result.startswith(f"{net}") and "connected to" in result
+                  and f"SSID: {ssid}" in link,
+                  f"connecting to {ssid}: {result}")
+            sta = run("iw", "dev", net, "station", "dump")
+            if not check("signal:" in sta.stdout,
+                         "station dump shows the access point's signal"):
+                print(sta.stdout + sta.stderr + link)
+            run("iw", "dev", net, "disconnect", check=True)
+            disconnects += 1
+            m = events.wait_for(rf"{net} \(phy #\d+\): disconnected", 10)
+            check(m is not None and
+                  "Not connected" in run("iw", "dev", net, "link").stdout,
+                  f"disconnecting from {ssid}")
+        result = test_connect(events, net, "hwsim-missing")
+        check("failed to connect" in result or "timed out" in result,
+              f"connecting to a missing network fails: {result}")
+        result = test_connect(events, net, "hwsim-2g-open")
+        check("connected to" in result,
+              f"connecting to hwsim-2g-open again: {result}")
+    finally:
+        events.close()
+    return disconnects
+
+
 def kernel_log():
     return run("dmesg").stdout.splitlines()
 
@@ -210,14 +351,20 @@ def run_tests(guest, log_start):
     r = run("ip", "link", "set", net, "down")
     check(r.returncode == 0 and not guest.is_up(),
           f"bringing {net} down brings the guest's wlan0 down")
-    check(counter(phy, "cmd_timeouts") == 0 and
-          counter(phy, "bad_responses") == 0,
-          "the driver's counters are zero")
+
+    # The guest reports each disconnection that the host asked for with the
+    # id of a connection that has already ended, which the driver ignores.
+    disconnects = test_scan_connect(phy, net)
+    values = counters(phy)
+    check(values.pop("stale_events") == disconnects and
+          all(v == 0 for v in values.values()),
+          f"the driver's counters are zero, with {disconnects} stale "
+          f"disconnections: {counters(phy)}")
 
     run("vdpa", "dev", "del", NAME, check=True)
     check(not os.path.exists(f"/sys/class/ieee80211/{phy}") and
           not os.path.exists(f"/sys/class/net/{net}"),
-          "removing the device removes the wiphy and the interface")
+          "removing a connected device removes the wiphy and the interface")
     phy, net = attach()
     if not check(phy is not None, "the device can be attached again"):
         return
@@ -263,10 +410,16 @@ def main():
     run("insmod", MODULE, check=True)
     log_start = len(kernel_log())
 
+    country = get_country()
+    if not allow_6ghz():
+        sys.exit(f"setting the host's country to {COUNTRY} does not permit "
+                 "6 GHz")
     guest = Guest(build, initrd, out)
     try:
         run_tests(guest, log_start)
     finally:
+        if country:
+            run("iw", "reg", "set", country)
         guest.kill()
         run("vdpa", "dev", "del", NAME)
         run(sys.executable, "-B",
