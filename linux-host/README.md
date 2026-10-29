@@ -1,33 +1,32 @@
-This is the Linux host tree for InvirtIO. This will be used if we make
-modifications to the host kernel that runs InvirtIO drivers. At the moment this
-is unused (the host kernel is still unpatched), but in the future we will use
-this kernel to allow more virtio devices and features to be used from VDUSE.
+This is the Linux host tree for InvirtIO. The host runs this kernel, which
+allows more virtio devices and features to be used from VDUSE.
 
 Currently this tree contains three VDUSE patches. Two allow virtio-gpu and
 virtio-wlan devices, and the other falls back to an unbound workqueue when
-none of a queue's affinity CPUs is online.
+none of a queue's affinity CPUs is online. It also adds the `virtio_wlan`
+host driver.
 
-`modules/` builds host modules out of tree against the running kernel, so
-that they load without booting this tree. It holds VDUSE from Debian's
-6.12.107 (the same files as the stable `v6.12.107` tag) with the virtio-wlan
-and workqueue patches backported. The module replaces the kernel's own:
-
-```
-make -C modules
-sudo rmmod vduse
-sudo insmod modules/vduse.ko
-```
-
-`sudo rmmod vduse && sudo modprobe vduse` returns to the kernel's.
-
-`modules/` also builds the `virtio_wlan` driver from this tree, through
-symbolic links to its source and headers. It loads with `sudo insmod
-modules/virtio_wlan.ko` after `sudo modprobe cfg80211`.
-
-To install the kernel
+The kernel is built in `build/` from the Debian kernel's configuration, with
+`vdpa`, `vduse`, `virtio_vdpa` and `virtio_wlan` as modules and without debug
+information:
 
 ```
-make
-sudo make modules_install
-sudo make install
+cd linux
+mkdir -p ../build
+cp /boot/config-$(uname -r) ../build/.config
+scripts/config --file ../build/.config \
+    --set-str SYSTEM_TRUSTED_KEYS "" --set-str SYSTEM_REVOCATION_KEYS "" \
+    --disable DEBUG_INFO_DWARF5 --disable DEBUG_INFO_DWARF4 \
+    --disable DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT --enable DEBUG_INFO_NONE \
+    --set-str LOCALVERSION "-invirtio" \
+    --module VDPA --module VDPA_USER --module VIRTIO_VDPA --module VIRTIO_WLAN
+make O=../build olddefconfig
+make O=../build -j$(nproc)
+sudo make O=../build modules_install
+sudo make O=../build install
 ```
+
+After a change to a module, `make O=../build modules_install` and reloading
+the module is enough, without a reboot.
+
+The modules are unsigned, so Secure Boot must be off.
