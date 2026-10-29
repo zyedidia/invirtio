@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 # Test the UML guest's virtio-wlan backend (G2 and G3 in docs/VIRTIO_WIFI.md)
-# without the host's virtio_wlan driver. Run as root, with the vduse module of
-# linux-host/modules loaded.
+# without the host's virtio_wlan driver. Run as root on the linux-host kernel.
 #
 # usage: vduse-wlan-backend-test.py <guest build dir> <initramfs> <output dir>
 #
@@ -590,6 +589,7 @@ def main():
     build, initrd, out = (os.path.abspath(a) for a in sys.argv[1:])
     os.makedirs(out, exist_ok=True)
 
+    subprocess.run(["modprobe", "vduse"], check=True)
     guest = Guest(build, initrd, out)
     dev = None
     try:

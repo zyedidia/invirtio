@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 # Check that the host's VDUSE accepts a virtio-wlan device (H1 in
-# docs/VIRTIO_WIFI.md). Run as root, with the vduse module of
-# linux-host/modules loaded.
+# docs/VIRTIO_WIFI.md). Run as root on the linux-host kernel.
 #
 # usage: vduse-wlan-probe.py [<name>]
 #
@@ -115,13 +114,14 @@ if __name__ == "__main__":
     name = sys.argv[1] if len(sys.argv) > 1 else "vwlan-probe"
     failed = False
 
+    subprocess.run(["modprobe", "vduse"], check=True)
     ctl = os.open("/dev/vduse/control", os.O_RDWR)
     fcntl.ioctl(ctl, VDUSE_SET_API_VERSION, bytearray(8))
     try:
         create(ctl, name)
     except OSError as e:
         sys.exit(f"creating {name} failed: {e.strerror}"
-                 " (is the vduse module of linux-host/modules loaded?)")
+                 " (is the linux-host kernel running?)")
     print(f"created {name} with queues {QUEUE_SIZES}")
 
     dev = None

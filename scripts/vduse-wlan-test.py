@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 # Test the host's virtio_wlan driver against the UML mac80211_hwsim guest of
-# docs/VIRTIO_WIFI.md (stages 1 and 2, and an open network). Run as root,
-# with the vduse module of linux-host/modules loaded.
+# docs/VIRTIO_WIFI.md (stages 1 and 2, and an open network). Run as root
+# on the linux-host kernel.
 #
 # usage: vduse-wlan-test.py <guest build dir> <initramfs> <output dir>
 #
-# The script loads linux-host/modules/virtio_wlan.ko in place of any loaded
-# copy, sets the host's country to DE for the 6 GHz band, boots the guest,
-# and attaches its device to virtio_vdpa. It checks that the host's wiphy has
+# The script loads virtio_wlan, sets the host's country to DE for the 6 GHz
+# band, boots the guest, and attaches its device to virtio_vdpa. It checks that the host's wiphy has
 # the guest's bands, channels, capabilities and ciphers, and that bringing
 # the host's interface up and down does the same to the guest's wlan0. It
 # then scans and checks that every network of the guest is found on its band,
@@ -35,8 +34,6 @@ NETWORKS.add("hwsim-6g-wpa3")
 COUNTERS = ["cmd_timeouts", "bad_responses", "bad_events", "stale_events",
             "bad_bss", "bad_connect_results", "bad_rates", "scan_timeouts",
             "connect_timeouts"]
-MODULE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                      "../linux-host/modules/virtio_wlan.ko")
 
 failures = []
 
@@ -156,6 +153,9 @@ def attach():
         if phys and nets:
             phy, net = os.path.basename(phys[0]), os.path.basename(nets[0])
             run("nmcli", "device", "set", net, "managed", "no")
+            # A new wiphy starts blocked while the host's WiFi is switched off.
+            for soft in glob.glob(f"/sys/class/ieee80211/{phy}/rfkill*/soft"):
+                write(soft, "0")
             run("ip", "link", "set", net, "down")
             return phy, net
         time.sleep(0.1)
@@ -179,8 +179,16 @@ def band_of(freq):
 
 
 def scan(net):
-    """Return the SSID and frequency of each BSS that a scan finds."""
-    r = run("timeout", "40", "iw", "dev", net, "scan")
+    """Return the SSID and frequency of each BSS that a scan finds. A scan
+    that NetworkManager started before the device became unmanaged makes
+    the first attempts fail with EBUSY."""
+    for _ in range(20):
+        r = run("timeout", "40", "iw", "dev", net, "scan")
+        if "(-16)" not in r.stderr:
+            break
+        time.sleep(1)
+    if r.returncode != 0:
+        print(f"iw scan failed with {r.returncode}: {r.stderr.strip()}")
     found = {}
     bss = None
     for line in r.stdout.splitlines():
@@ -404,10 +412,9 @@ def main():
     os.makedirs(out, exist_ok=True)
 
     run("modprobe", "cfg80211", check=True)
+    run("modprobe", "vduse", check=True)
     run("modprobe", "virtio_vdpa", check=True)
-    if os.path.exists("/sys/module/virtio_wlan"):
-        run("rmmod", "virtio_wlan", check=True)
-    run("insmod", MODULE, check=True)
+    run("modprobe", "virtio_wlan", check=True)
     log_start = len(kernel_log())
 
     country = get_country()
