@@ -20,6 +20,10 @@ sudo insmod modules/vduse.ko
 
 `sudo rmmod vduse && sudo modprobe vduse` returns to the kernel's.
 
+`modules/` also builds the `virtio_wlan` driver from this tree, through
+symbolic links to its source and headers. It loads with `sudo insmod
+modules/virtio_wlan.ko` after `sudo modprobe cfg80211`.
+
 To install the kernel
 
 ```

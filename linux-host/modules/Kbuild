@@ -1,3 +1,7 @@
 # VDUSE from the running kernel's version, which replaces the kernel's own.
 obj-m += vduse.o
 vduse-y := vduse_dev.o iova_domain.o
+
+# The virtio-wlan driver, whose source and headers are in linux-host/linux.
+obj-m += virtio_wlan.o
+CFLAGS_virtio_wlan.o := -I$(src)/include
