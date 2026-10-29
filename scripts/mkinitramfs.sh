@@ -30,7 +30,9 @@ Other options:
   -b <binary>  a host binary to add, with its shared libraries
 
 Firmware is read from /lib/firmware/updates and /lib/firmware. Compressed
-files are stored decompressed. A driver often lists firmware for several
+files are stored decompressed. regulatory.db and its signature come from the
+-upstream files when the host has them, since the guest trusts only the
+upstream signing key and Debian points the standard names at its own build. A driver often lists firmware for several
 chips, so -d skips files that the host does not have. A guest that is still
 missing firmware logs each file it could not load, and -l adds those files.
 EOF
@@ -126,10 +128,15 @@ FW_COUNT=0
 
 # Add the firmware file <name>. Return 1 if the host does not have it.
 add_firmware() {
-    local name=$1 dir src dst
+    local name=$1 dir src dst upstream=
     [ -n "${HAVE[/lib/firmware/$name]:-}" ] && return 0
+    case $name in
+    regulatory.db | regulatory.db.p7s) upstream=$name-upstream ;;
+    esac
     for dir in "${FW_DIRS[@]}"; do
-        if [ -f "$dir/$name" ]; then
+        if [ -n "$upstream" ] && [ -f "$dir/$upstream" ]; then
+            src=$dir/$upstream
+        elif [ -f "$dir/$name" ]; then
             src=$dir/$name
         elif [ -f "$dir/$name.zst" ]; then
             dst=$ROOT/lib/firmware/$name
