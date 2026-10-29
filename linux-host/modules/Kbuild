@@ -1,0 +1,3 @@
+# VDUSE from the running kernel's version, which replaces the kernel's own.
+obj-m += vduse.o
+vduse-y := vduse_dev.o iova_domain.o
