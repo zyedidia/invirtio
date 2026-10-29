@@ -1,0 +1,180 @@
+#!/bin/sh
+# The init script of a virtio-wlan test guest, for mkinitramfs.sh -i. The
+# guest has four mac80211_hwsim radios (mac80211_hwsim.radios=4). The first
+# radio, wlan0, is the station that the guest exports, and it stays down and
+# has no address. The other three run access points on 2.4, 5 and 6 GHz. The
+# access points share the bridge br0, which runs a DHCP server and an iperf3
+# server.
+#
+# The country comes from cfg80211.ieee80211_regdom, which must be one where
+# 6 GHz is not NO-IR, such as DE or GB, since hostapd cannot beacon on a
+# NO-IR channel. The script prints "wlan-hwsim-init: ready" once every access
+# point is beaconing. With init_shell on the kernel command line, it then
+# starts a shell. Otherwise it waits until the guest is stopped.
+
+export PATH=/sbin:/usr/sbin:/bin:/usr/bin
+mount -t devtmpfs devtmpfs /dev
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+
+PASSPHRASE=invirtio-hwsim
+ADDR=192.168.100.1
+COUNTRY=$(cat /sys/module/cfg80211/parameters/ieee80211_regdom)
+
+init_shell() {
+	case " $(cat /proc/cmdline) " in
+	*" init_shell "*)
+		return 0
+		;;
+	esac
+	return 1
+}
+
+fail() {
+	echo "wlan-hwsim-init: $*"
+	init_shell && exec sh
+	poweroff -f
+}
+
+# Wait up to ten seconds for a command to succeed.
+wait_for() {
+	i=0
+	until eval "$1" >/dev/null 2>&1; do
+		i=$((i + 1))
+		[ $i -le 100 ] || return 1
+		sleep 0.1
+	done
+}
+
+# The fields that every access point shares.
+ap_common() {
+	cat <<EOF
+driver=nl80211
+interface=$1
+bridge=br0
+country_code=$COUNTRY
+ieee80211d=1
+EOF
+}
+
+# The first network of a radio is open. The others are added with bss=
+# sections: WPA2-PSK, WPA2-PSK with required MFP, and the WPA2/WPA3
+# transition mode.
+ap_networks() {
+	cat <<EOF
+ssid=hwsim-$2-open
+
+bss=$1-1
+bridge=br0
+ssid=hwsim-$2-wpa2
+wpa=2
+wpa_key_mgmt=WPA-PSK
+rsn_pairwise=CCMP
+wpa_passphrase=$PASSPHRASE
+
+bss=$1-2
+bridge=br0
+ssid=hwsim-$2-wpa2-mfp
+wpa=2
+wpa_key_mgmt=WPA-PSK
+rsn_pairwise=CCMP
+ieee80211w=2
+wpa_passphrase=$PASSPHRASE
+
+bss=$1-3
+bridge=br0
+ssid=hwsim-$2-wpa3-transition
+wpa=2
+wpa_key_mgmt=WPA-PSK SAE
+rsn_pairwise=CCMP
+ieee80211w=1
+wpa_passphrase=$PASSPHRASE
+EOF
+}
+
+[ -d /sys/class/net/wlan3 ] ||
+	fail "the guest needs mac80211_hwsim.radios=4"
+[ -n "$COUNTRY" ] && [ "$COUNTRY" != 00 ] ||
+	fail "the guest needs cfg80211.ieee80211_regdom set to a country"
+wait_for "iw reg get | grep -q 'country $COUNTRY:'" ||
+	fail "the regulatory domain did not change to $COUNTRY"
+
+ip link set lo up
+brctl addbr br0
+ip addr add $ADDR/24 dev br0
+ip link set br0 up
+
+{
+	ap_common wlan1
+	cat <<EOF
+hw_mode=g
+channel=1
+ieee80211n=1
+ieee80211ax=1
+EOF
+	ap_networks wlan1 2g
+} > /tmp/hostapd-2g.conf
+
+{
+	ap_common wlan2
+	cat <<EOF
+hw_mode=a
+channel=36
+ieee80211n=1
+ht_capab=[HT40+]
+ieee80211ac=1
+vht_oper_chwidth=1
+vht_oper_centr_freq_seg0_idx=42
+ieee80211ax=1
+he_oper_chwidth=1
+he_oper_centr_freq_seg0_idx=42
+EOF
+	ap_networks wlan2 5g
+} > /tmp/hostapd-5g.conf
+
+# hostapd accepts only SAE on 6 GHz, with hash-to-element and required MFP.
+{
+	ap_common wlan3
+	cat <<EOF
+hw_mode=a
+op_class=131
+channel=5
+ieee80211ax=1
+ssid=hwsim-6g-wpa3
+wpa=2
+wpa_key_mgmt=SAE
+rsn_pairwise=CCMP
+ieee80211w=2
+sae_pwe=1
+sae_password=$PASSPHRASE
+EOF
+} > /tmp/hostapd-6g.conf
+
+for band in 2g 5g 6g; do
+	hostapd -B -P /tmp/hostapd-$band.pid -f /tmp/hostapd-$band.log \
+		/tmp/hostapd-$band.conf ||
+		fail "hostapd for $band did not start: $(cat /tmp/hostapd-$band.log)"
+done
+
+for dev in wlan1 wlan1-1 wlan1-2 wlan1-3 wlan2 wlan2-1 wlan2-2 wlan2-3 wlan3; do
+	wait_for "grep -qx up /sys/class/net/$dev/operstate" ||
+		fail "$dev is not beaconing: $(cat /tmp/hostapd-*.log)"
+done
+
+cat > /tmp/udhcpd.conf <<EOF
+interface br0
+start 192.168.100.100
+end 192.168.100.199
+option subnet 255.255.255.0
+lease_file /tmp/udhcpd.leases
+pidfile /tmp/udhcpd.pid
+EOF
+touch /tmp/udhcpd.leases
+udhcpd /tmp/udhcpd.conf || fail "udhcpd did not start"
+iperf3 -s -D -B $ADDR || fail "iperf3 did not start"
+
+echo "wlan-hwsim-init: ready"
+init_shell && exec sh
+while :; do
+	sleep 3600
+done
