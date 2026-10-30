@@ -6,19 +6,21 @@
 # usage: vduse-wlan-test.py <guest build dir> <initramfs> <output dir>
 #
 # The script loads virtio_wlan, sets the host's country to DE for the 6 GHz
-# band, boots the guest, and attaches its device to virtio_vdpa. It checks that the host's wiphy has
-# the guest's bands, channels, capabilities and ciphers, and that bringing
-# the host's interface up and down does the same to the guest's wlan0. It
-# then scans and checks that every network of the guest is found on its band,
-# connects to the open networks on 2.4 and 5 GHz, checks the station and
-# disconnects, checks that a missing network fails, and checks that the
-# driver's counters are zero. It removes the device while connected and
-# attaches it again, kills the guest, and checks that a command times out and
-# that the device can still be removed. It also checks that neither kernel
-# logs a warning, and restores the host's country. The guest's console goes
-# to guest.log in the output directory.
+# band, boots the guest, and attaches its device to virtio_vdpa. It checks that
+# the host's wiphy has the guest's bands, channels, capabilities and ciphers,
+# and that bringing the host's interface up and down does the same to the
+# guest's wlan0. It then scans and checks that every network of the guest is
+# found on its band, connects to the open networks on 2.4 and 5 GHz, checks the
+# station, gets a DHCP lease, pings the access points' bridge and runs iperf3
+# against it in both directions, and disconnects, checks that a missing network
+# fails, and checks that the driver's counters are zero. It removes the device
+# while connected and attaches it again, kills the guest, and checks that a
+# command times out and that the device can still be removed. It also checks
+# that neither kernel logs a warning, and restores the host's country. The
+# guest's console goes to guest.log in the output directory.
 
 import glob
+import json
 import os
 import re
 import signal
@@ -33,7 +35,17 @@ NETWORKS = {f"hwsim-{band}-{kind}" for band in ("2g", "5g")
 NETWORKS.add("hwsim-6g-wpa3")
 COUNTERS = ["cmd_timeouts", "bad_responses", "bad_events", "stale_events",
             "bad_bss", "bad_connect_results", "bad_rates", "scan_timeouts",
-            "connect_timeouts"]
+            "connect_timeouts", "bad_rx_frames", "tx_timeouts",
+            "rx_post_errors"]
+GUEST_COUNTERS = ["tx_invalid", "tx_spoofed", "tx_dropped", "rx_oversized",
+                  "rx_bad_buffers"]
+SERVER = "192.168.100.1"
+# The lease adds only the address and its subnet's route, and no default
+# route.
+UDHCPC_SCRIPT = """#!/bin/sh
+[ "$1" = bound ] && ip addr add "$ip/$mask" dev "$interface"
+exit 0
+"""
 
 failures = []
 
@@ -261,10 +273,51 @@ def test_connect(events, net, ssid):
     return m.group(0) if m else "no connection event"
 
 
-def test_scan_connect(phy, net):
-    """Scan all three bands, then connect to open networks and leave the
-    last connection up. Return the number of disconnections that the host
-    asked for."""
+def carrier(net):
+    with open(f"/sys/class/net/{net}/carrier") as f:
+        return f.read().strip() == "1"
+
+
+def test_traffic(guest, net, out):
+    """Get a lease from the guest's DHCP server, then ping its access points'
+    bridge and run iperf3 against it both ways."""
+    check(carrier(net), f"{net} has a carrier while connected")
+    script = os.path.join(out, "udhcpc.sh")
+    with open(script, "w") as f:
+        f.write(UDHCPC_SCRIPT)
+    os.chmod(script, 0o755)
+    r = run("busybox", "udhcpc", "-i", net, "-f", "-n", "-q", "-t", "5",
+            "-T", "2", "-s", script)
+    addr = run("ip", "-4", "-br", "addr", "show", net).stdout.split()[2:]
+    if not check(r.returncode == 0 and addr,
+                 f"{net} gets a DHCP lease: {' '.join(addr)}"):
+        print(r.stdout + r.stderr)
+        return
+    try:
+        r = run("ping", "-c", "5", "-i", "0.2", "-W", "2", "-I", net, SERVER)
+        m = re.search(r"(\d+) received", r.stdout)
+        check(r.returncode == 0 and m and m.group(1) == "5",
+              f"ping {SERVER}: {m.group(0) if m else r.stdout + r.stderr}")
+        for args, what in (((), "to"), (("-R",), "from")):
+            r = run("timeout", "30", "iperf3", "-c", SERVER, "--bind-dev",
+                    net, "-t", "3", "-J", *args)
+            try:
+                bps = json.loads(r.stdout)["end"]["sum_received"][
+                    "bits_per_second"]
+            except (ValueError, KeyError):
+                bps = 0
+            if not check(r.returncode == 0 and bps > 0,
+                         f"iperf3 {what} the guest: {bps / 1e6:.0f} Mb/s"):
+                print(r.stdout[-2000:] + r.stderr)
+                print(guest.output("pidof iperf3; cat /tmp/iperf3.log"))
+    finally:
+        run("ip", "-4", "addr", "flush", "dev", net)
+
+
+def test_scan_connect(guest, phy, net, out):
+    """Scan all three bands, then connect to open networks, pass traffic,
+    and leave the last connection up. Return the number of disconnections
+    that the host asked for."""
     r = run("ip", "link", "set", net, "up")
     if not check(r.returncode == 0, f"{net} comes up"):
         return 0
@@ -291,12 +344,13 @@ def test_scan_connect(phy, net):
             if not check("signal:" in sta.stdout,
                          "station dump shows the access point's signal"):
                 print(sta.stdout + sta.stderr + link)
+            test_traffic(guest, net, out)
             run("iw", "dev", net, "disconnect", check=True)
             disconnects += 1
             m = events.wait_for(rf"{net} \(phy #\d+\): disconnected", 10)
-            check(m is not None and
+            check(m is not None and not carrier(net) and
                   "Not connected" in run("iw", "dev", net, "link").stdout,
-                  f"disconnecting from {ssid}")
+                  f"disconnecting from {ssid} drops the carrier")
         result = test_connect(events, net, "hwsim-missing")
         check("failed to connect" in result or "timed out" in result,
               f"connecting to a missing network fails: {result}")
@@ -362,12 +416,19 @@ def run_tests(guest, log_start):
 
     # The guest reports each disconnection that the host asked for with the
     # id of a connection that has already ended, which the driver ignores.
-    disconnects = test_scan_connect(phy, net)
+    disconnects = test_scan_connect(guest, phy, net,
+                                    os.path.dirname(guest.path))
     values = counters(phy)
     check(values.pop("stale_events") == disconnects and
           all(v == 0 for v in values.values()),
           f"the driver's counters are zero, with {disconnects} stale "
           f"disconnections: {counters(phy)}")
+    stats = dict(re.findall(r"^\s+(\w+)\s+(\d+)\s*$",
+                            guest.output("cat /proc/vduse_guest"), re.M))
+    check(all(stats.get(name) == "0" for name in GUEST_COUNTERS),
+          "the backend's drop counters are zero: " +
+          ", ".join(f"{k} {v}" for k, v in stats.items()
+                    if k.startswith(("tx_", "rx_"))))
 
     run("vdpa", "dev", "del", NAME, check=True)
     check(not os.path.exists(f"/sys/class/ieee80211/{phy}") and

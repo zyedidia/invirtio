@@ -497,7 +497,8 @@ def run_tests(dev, guest):
           == S_NETDOWN, "SCAN after CLOSE is NETDOWN")
 
     guest.shell("cat /proc/vduse_guest")
-    log = guest.wait_for("umem_regs", 10) and guest.wait_for("rx_dropped", 10)
+    log = (guest.wait_for("umem_regs", 10) and
+           guest.wait_for("rx_bad_buffers", 10))
     counters = {}
     for line in guest.log().splitlines():
         parts = line.split()

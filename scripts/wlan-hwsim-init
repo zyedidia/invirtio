@@ -171,7 +171,8 @@ pidfile /tmp/udhcpd.pid
 EOF
 touch /tmp/udhcpd.leases
 udhcpd /tmp/udhcpd.conf || fail "udhcpd did not start"
-iperf3 -s -D -B $ADDR || fail "iperf3 did not start"
+iperf3 -s -D -B $ADDR --logfile /tmp/iperf3.log ||
+	fail "iperf3 did not start"
 
 echo "wlan-hwsim-init: ready"
 init_shell && exec sh
