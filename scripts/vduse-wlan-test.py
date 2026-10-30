@@ -8,21 +8,26 @@
 # band, boots the guest, and attaches its device to virtio_vdpa. It checks that
 # the host's wiphy has the guest's bands, channels, capabilities and ciphers,
 # and that bringing the host's interface up and down does the same to the
-# guest's wlan0. It then scans and checks that every network of the guest is
-# found on its band, connects to the open networks on 2.4 and 5 GHz, checks the
-# station, gets a DHCP lease, pings the access points' bridge and runs iperf3
-# against it in both directions, and disconnects. It then joins the WPA2
-# networks, with and without MFP, with wpa_supplicant, checks that the pairwise
-# and group keys are renewed, passes the same traffic and disconnects, has
-# NetworkManager join three of them and pings through them, checks that a
-# missing network fails, and checks that the driver's counters are zero. It
-# removes the device while connected and attaches it again, kills the guest,
-# and checks that a command times out and that the device can still be removed.
-# It also checks that neither kernel logs a warning, and restores the host's
-# country. The guest's console goes to guest.log in the output directory.
-# NetworkManager can start the system wpa_supplicant, if it is not running,
-# when the interface appears or when the test gives it the interface, and the
-# test leaves it running.
+# guest's wlan0, and that the host's address, power save and country reach the
+# guest. It then scans and checks that every network of the guest is found on
+# its band, connects to the open networks on 2.4 and 5 GHz, checks the station,
+# gets a DHCP lease, pings the access points' bridge and runs iperf3 against it
+# in both directions, and disconnects. It then joins the WPA2 networks, with
+# and without MFP, with wpa_supplicant, checks that the pairwise and group keys
+# are renewed, passes the same traffic and disconnects, has NetworkManager join
+# three of them and pings through them, checks that a missing network fails,
+# and checks that the driver's counters are zero. It restarts the guest's radio
+# while wpa_supplicant is connected and checks that it joins again. It removes
+# the device while connected and attaches it again, kills the guest while
+# traffic flows and checks that the host ends the connection, that the broken
+# device fails commands at once and that it can still be removed. With a second
+# guest, it removes the guest's interface while connected and checks that the
+# host's connection ends at once and the device can be removed without a
+# timeout. It also checks that neither kernel logs a warning, and restores the
+# host's country. The guest's console goes to guest.log in the output
+# directory. NetworkManager can start the system wpa_supplicant, if it is not
+# running, when the interface appears or when the test gives it the interface,
+# and the test leaves it running.
 
 import glob
 import json
@@ -84,11 +89,12 @@ def run(*args, check=False):
 
 
 class Guest:
-    def __init__(self, build, initrd, out):
-        self.path = os.path.join(out, "guest.log")
+    def __init__(self, build, initrd, out, name="guest"):
+        self.path = os.path.join(out, f"{name}.log")
         self.logf = open(self.path, "w")
         self.marks = 0
-        cmd = [os.path.join(build, "linux"), f"umid=vwlan-{os.getpid()}",
+        cmd = [os.path.join(build, "linux"),
+               f"umid=vwlan-{name}-{os.getpid()}",
                "mem=768M", f"initrd={initrd}", "mac80211_hwsim.radios=4",
                "cfg80211.ieee80211_regdom=DE",
                f"vduse_guest.device=wlan,{NAME},netdev=wlan0,"
@@ -378,10 +384,8 @@ def carrier(net):
         return f.read().strip() == "1"
 
 
-def test_traffic(guest, net, out):
-    """Get a lease from the guest's DHCP server, then ping its access points'
-    bridge and run iperf3 against it both ways."""
-    check(carrier(net), f"{net} has a carrier while connected")
+def lease(net, out):
+    """Get a lease from the guest's DHCP server and return the addresses."""
     script = os.path.join(out, "udhcpc.sh")
     with open(script, "w") as f:
         f.write(UDHCPC_SCRIPT)
@@ -392,6 +396,14 @@ def test_traffic(guest, net, out):
     if not check(r.returncode == 0 and addr,
                  f"{net} gets a DHCP lease: {' '.join(addr)}"):
         print(r.stdout + r.stderr)
+    return addr if r.returncode == 0 else []
+
+
+def test_traffic(guest, net, out):
+    """Get a lease from the guest's DHCP server, then ping its access points'
+    bridge and run iperf3 against it both ways."""
+    check(carrier(net), f"{net} has a carrier while connected")
+    if not lease(net, out):
         return
     try:
         r = run("ping", "-c", "5", "-i", "0.2", "-W", "2", "-I", net, SERVER)
@@ -399,11 +411,13 @@ def test_traffic(guest, net, out):
         check(r.returncode == 0 and m and m.group(1) == "5",
               f"ping {SERVER}: {m.group(0) if m else r.stdout + r.stderr}")
         for args, what in (((), "to"), (("-R",), "from")):
-            # The server stops listening for a moment between tests.
+            # The server stops listening for a moment between tests, or
+            # drops a control connection that arrives then.
             for _ in range(5):
                 r = run("timeout", "30", "iperf3", "-c", SERVER, "--bind-dev",
                         net, "-t", "3", "-J", *args)
-                if "Connection refused" not in r.stdout:
+                if ("Connection refused" not in r.stdout and
+                        "Connection reset" not in r.stdout):
                     break
                 time.sleep(1)
             try:
@@ -425,9 +439,11 @@ def wpa_state(net, ctrl):
     return m.group(1) if m else ""
 
 
-def test_wpa(guest, net, out, ssid, mfp):
+def test_wpa(guest, net, out, ssid, mfp, reset=False):
     """Join a network with wpa_supplicant and pass traffic. On a network that
-    renews its keys, wait for both to be renewed first."""
+    renews its keys, wait for both to be renewed first. With reset, restart
+    the guest's radio as a firmware recovery does, and check that
+    wpa_supplicant joins again."""
     ctrl = os.path.join(out, "wpa")
     conf = os.path.join(out, "wpa_supplicant.conf")
     log = os.path.join(out, f"wpa-{ssid}.log")
@@ -451,6 +467,24 @@ def test_wpa(guest, net, out, ssid, mfp):
             with open(log) as f:
                 print(f.read()[-3000:])
             return
+        if reset:
+            said = guest.output("mount -t debugfs none /sys/kernel/debug; "
+                                "echo 1 > /sys/kernel/debug/ieee80211/$(cat "
+                                "/sys/class/net/wlan0/phy80211/name)/reset "
+                                "&& echo reset-''done")
+            # The restart ends the connection, and wpa_supplicant joins
+            # again.
+            end = time.time() + 30
+            while time.time() < end:
+                with open(log) as f:
+                    again = f.read().count("CTRL-EVENT-CONNECTED") >= 2
+                if again and wpa_state(net, ctrl) == "COMPLETED":
+                    break
+                time.sleep(0.2)
+            check("reset-done" in said and again and
+                  wpa_state(net, ctrl) == "COMPLETED",
+                  f"wpa_supplicant joins {ssid} again after the guest's "
+                  "radio restarts")
         if ssid in REKEYED:
             time.sleep(8)
             with open(log) as f:
@@ -477,9 +511,11 @@ def test_wpa(guest, net, out, ssid, mfp):
             time.sleep(5)
         with open(log) as f:
             text = f.read()
-        check(text.count("CTRL-EVENT-CONNECTED") == 1 and
-              "CTRL-EVENT-DISCONNECTED" not in text,
-              f"{ssid} stays connected throughout")
+        # A restarted radio may end the connection.
+        if not reset:
+            check(text.count("CTRL-EVENT-CONNECTED") == 1 and
+                  "CTRL-EVENT-DISCONNECTED" not in text,
+                  f"{ssid} stays connected throughout")
     finally:
         proc.terminate()
         try:
@@ -560,6 +596,46 @@ def test_nm(net, ssid, mfp):
         run("ip", "link", "set", net, "up")
 
 
+def guest_says(guest, command, text, timeout=5):
+    """Return whether a guest command's output comes to hold the text."""
+    end = time.time() + timeout
+    while time.time() < end:
+        if text in guest.output(command):
+            return True
+        time.sleep(0.5)
+    return False
+
+
+def test_settings(guest, net):
+    """Check that the host's address, power save and country reach the
+    guest, and leave the interface down."""
+    with open(f"/sys/class/net/{net}/address") as f:
+        orig = f.read().strip()
+    new = "02:11:22:33:44:55"
+    r = run("ip", "link", "set", net, "address", new)
+    check(r.returncode == 0 and
+          guest_says(guest, "cat /sys/class/net/wlan0/address", new),
+          f"setting {net}'s address sets the guest's {r.stderr}")
+    run("ip", "link", "set", net, "address", orig)
+
+    run("ip", "link", "set", net, "up", check=True)
+    results = []
+    # Setting the current state sends nothing, so it is turned off first.
+    for state in ("off", "on"):
+        r = run("iw", "dev", net, "set", "power_save", state)
+        results.append(r.returncode == 0 and guest_says(
+            guest, "iw dev wlan0 get power_save", f"Power save: {state}"))
+    check(all(results), "power save on the host turns it on and off in the "
+          "guest")
+    run("ip", "link", "set", net, "down")
+
+    results = []
+    for country in ("GB", COUNTRY):
+        run("iw", "reg", "set", country)
+        results.append(guest_says(guest, "iw reg get", f"country {country}:"))
+    check(all(results), "the host's country reaches the guest")
+
+
 def test_scan_connect(guest, phy, net, out):
     """Scan all three bands, then connect to open and WPA2 networks, pass
     traffic, and leave the last connection up. Return the number of
@@ -602,7 +678,10 @@ def test_scan_connect(guest, phy, net, out):
                   f"disconnecting from {ssid} drops the carrier")
         # wpa_supplicant and NetworkManager decide how often they
         # disconnect, so the disconnections that the host asked for are
-        # counted from their events.
+        # counted from their events. They can also end a connection attempt
+        # or a scan, which the host reports with no disconnection event, and
+        # whose later events from the guest are stale as well. A
+        # disconnection that the guest makes on its own is not stale.
         before = settled_counter(phy, "stale_events")
         events.close()
         events = Events()
@@ -618,10 +697,19 @@ def test_scan_connect(guest, phy, net, out):
         local = events.count(rf"{net} \(phy #\d+\): disconnected "
                              rf"\(local request\)")
         check(before is not None and after is not None and
-              after - before == local,
+              after - before >= local,
               f"the guest reports the {local} disconnections that "
-              f"wpa_supplicant and NetworkManager asked for, and no other")
-        disconnects += local
+              f"wpa_supplicant and NetworkManager asked for")
+        if before is not None and after is not None:
+            disconnects += after - before
+        # The guest's own end of the connection when its radio restarts
+        # also looks like a local request, so the restart is counted from
+        # the counter alone.
+        before = settled_counter(phy, "stale_events")
+        test_wpa(guest, net, out, "hwsim-5g-wpa2-mfp", 2, reset=True)
+        after = settled_counter(phy, "stale_events")
+        if before is not None and after is not None:
+            disconnects += after - before
         # The events of wpa_supplicant's connections are not the test's.
         events.close()
         events = Events()
@@ -634,6 +722,75 @@ def test_scan_connect(guest, phy, net, out):
     finally:
         events.close()
     return disconnects
+
+
+def test_killed(guest, phy, net, out):
+    """Kill the guest while traffic flows. The host finds the dead device
+    once the frames it sent stop being reclaimed and a probe of the
+    connection times out, and ends the connection."""
+    run("ip", "link", "set", net, "up")
+    events = Events()
+    try:
+        result = test_connect(events, net, "hwsim-2g-open")
+        if not check("connected to" in result and lease(net, out),
+                     f"connecting to hwsim-2g-open before the kill: {result}"):
+            return
+        load = subprocess.Popen(["iperf3", "-c", SERVER, "--bind-dev", net,
+                                 "-t", "60"], stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL, env=ENV)
+        time.sleep(3)
+        guest.kill()
+        start = time.time()
+        m = events.wait_for(rf"{net} \(phy #\d+\): disconnected", 30)
+        took = time.time() - start
+        load.kill()
+        load.wait()
+        check(m is not None and not carrier(net) and
+              counter(phy, "cmd_timeouts") == 1,
+              f"killing the guest during traffic ends the connection after "
+              f"{took:.1f} s")
+    finally:
+        events.close()
+        run("ip", "-4", "addr", "flush", "dev", net)
+
+
+def test_gone(guest, out):
+    """Remove the guest's interface while the host is connected. The guest
+    reports the disconnection at once and fails later commands at once."""
+    if not check(guest.wait_for(f"{NAME}: created wlan device", 90) and
+                 guest.wait_for("wlan-hwsim-init: ready", 90),
+                 "a second guest creates the device"):
+        return
+    phy, net = attach()
+    if not check(phy is not None, "the second guest's device is attached"):
+        return
+    run("ip", "link", "set", net, "up")
+    events = Events()
+    try:
+        result = test_connect(events, net, "hwsim-2g-open")
+        if not check("connected to" in result,
+                     f"connecting to hwsim-2g-open: {result}"):
+            return
+        guest.output("iw dev wlan0 del")
+        m = events.wait_for(rf"{net} \(phy #\d+\): disconnected", 5)
+        check(m is not None and not carrier(net) and
+              counter(phy, "cmd_timeouts") == 0,
+              "removing the guest's interface ends the host's connection at "
+              "once")
+        run("ip", "link", "set", net, "down")
+        start = time.time()
+        r = run("ip", "link", "set", net, "up")
+        took = time.time() - start
+        check(r.returncode != 0 and took < 2 and
+              counter(phy, "cmd_timeouts") == 0,
+              "the device then fails commands without a timeout")
+        start = time.time()
+        run("vdpa", "dev", "del", NAME)
+        took = time.time() - start
+        check(not os.path.exists(f"/sys/class/net/{net}") and took < 5,
+              f"the device is removed in {took:.1f} s")
+    finally:
+        events.close()
 
 
 def kernel_log():
@@ -687,6 +844,7 @@ def run_tests(guest, log_start):
     r = run("ip", "link", "set", net, "down")
     check(r.returncode == 0 and not guest.is_up(),
           f"bringing {net} down brings the guest's wlan0 down")
+    test_settings(guest, net)
 
     # The guest reports each disconnection that the host asked for with the
     # id of a connection that has already ended, which the driver ignores.
@@ -717,13 +875,8 @@ def run_tests(guest, log_start):
     if not check(phy is not None, "the device can be attached again"):
         return
 
-    guest.kill()
-    start = time.time()
-    r = run("ip", "link", "set", net, "up")
-    took = time.time() - start
-    check(r.returncode != 0 and 4 < took < 10 and
-          counter(phy, "cmd_timeouts") == 1,
-          f"a command to a dead guest times out after {took:.1f} s")
+    test_killed(guest, phy, net, os.path.dirname(guest.path))
+    run("ip", "link", "set", net, "down")
     start = time.time()
     r = run("ip", "link", "set", net, "up")
     took = time.time() - start
@@ -735,13 +888,6 @@ def run_tests(guest, log_start):
     check(not os.path.exists(f"/sys/class/ieee80211/{phy}") and
           not os.path.exists(f"/sys/class/net/{net}"),
           "a broken device can be removed")
-
-    found = warnings(guest.log()[guest.log().find(
-        "wlan-hwsim-init: ready"):].splitlines())
-    found += warnings(kernel_log()[log_start:])
-    for w in found:
-        print("warning: " + w)
-    check(not found, "neither kernel logs a warning")
 
 
 def main():
@@ -762,15 +908,32 @@ def main():
         sys.exit(f"setting the host's country to {COUNTRY} does not permit "
                  "6 GHz")
     guest = Guest(build, initrd, out)
+    destroy = [sys.executable, "-B",
+               os.path.join(os.path.dirname(__file__), "vduse-destroy.py"),
+               NAME]
+    guests = [guest]
     try:
         run_tests(guest, log_start)
+        guest.kill()
+        run("vdpa", "dev", "del", NAME)
+        run(*destroy)
+        guest = Guest(build, initrd, out, "gone")
+        guests.append(guest)
+        test_gone(guest, out)
+        found = []
+        for g in guests:
+            found += warnings(g.log()[g.log().find(
+                "wlan-hwsim-init: ready"):].splitlines())
+        found += warnings(kernel_log()[log_start:])
+        for w in found:
+            print("warning: " + w)
+        check(not found, "neither kernel logs a warning")
     finally:
         if country:
             run("iw", "reg", "set", country)
         guest.kill()
         run("vdpa", "dev", "del", NAME)
-        run(sys.executable, "-B",
-            os.path.join(os.path.dirname(__file__), "vduse-destroy.py"), NAME)
+        run(*destroy)
 
     print(f"{len(failures)} failures" if failures else "PASS")
     sys.exit(1 if failures else 0)
