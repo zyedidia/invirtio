@@ -112,13 +112,20 @@ add_link() {
     echo "slink $path $target 0777 0 0" >> "$LIST"
 }
 
-# Add a binary and the shared libraries it loads.
+# Add a binary and the shared libraries it loads. glibc also opens libgcc_s
+# at run time to unwind threads in pthread_cancel(), which ldd does not list.
 add_binary() {
-    local bin=$1 lib
+    local bin=$1 lib gcc_s
     add_file "$bin" "$bin" 0755
     for lib in $(ldd "$bin" 2>/dev/null |
                  awk '$2 == "=>" && $3 ~ /^\// { print $3 } $1 ~ /^\// { print $1 }'); do
         add_file "$lib" "$lib" 0755
+        case $lib in
+        */libc.so.6)
+            gcc_s=$(dirname "$lib")/libgcc_s.so.1
+            [ ! -f "$gcc_s" ] || add_file "$gcc_s" "$gcc_s" 0755
+            ;;
+        esac
     done
 }
 
