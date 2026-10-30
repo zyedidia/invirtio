@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 # Test the host's virtio_wlan driver against the UML mac80211_hwsim guest of
-# docs/VIRTIO_WIFI.md (stages 1 and 2, and an open network). Run as root
-# on the linux-host kernel.
+# docs/VIRTIO_WIFI.md (stages 1 to 4). Run as root on the linux-host kernel.
 #
 # usage: vduse-wlan-test.py <guest build dir> <initramfs> <output dir>
 #
@@ -12,12 +11,18 @@
 # guest's wlan0. It then scans and checks that every network of the guest is
 # found on its band, connects to the open networks on 2.4 and 5 GHz, checks the
 # station, gets a DHCP lease, pings the access points' bridge and runs iperf3
-# against it in both directions, and disconnects, checks that a missing network
-# fails, and checks that the driver's counters are zero. It removes the device
-# while connected and attaches it again, kills the guest, and checks that a
-# command times out and that the device can still be removed. It also checks
-# that neither kernel logs a warning, and restores the host's country. The
-# guest's console goes to guest.log in the output directory.
+# against it in both directions, and disconnects. It then joins the WPA2
+# networks, with and without MFP, with wpa_supplicant, checks that the pairwise
+# and group keys are renewed, passes the same traffic and disconnects, has
+# NetworkManager join three of them and pings through them, checks that a
+# missing network fails, and checks that the driver's counters are zero. It
+# removes the device while connected and attaches it again, kills the guest,
+# and checks that a command times out and that the device can still be removed.
+# It also checks that neither kernel logs a warning, and restores the host's
+# country. The guest's console goes to guest.log in the output directory.
+# NetworkManager can start the system wpa_supplicant, if it is not running,
+# when the interface appears or when the test gives it the interface, and the
+# test leaves it running.
 
 import glob
 import json
@@ -36,10 +41,22 @@ NETWORKS.add("hwsim-6g-wpa3")
 COUNTERS = ["cmd_timeouts", "bad_responses", "bad_events", "stale_events",
             "bad_bss", "bad_connect_results", "bad_rates", "scan_timeouts",
             "connect_timeouts", "bad_rx_frames", "tx_timeouts",
-            "rx_post_errors"]
+            "rx_post_errors", "eapol_timeouts"]
 GUEST_COUNTERS = ["tx_invalid", "tx_spoofed", "tx_dropped", "rx_oversized",
                   "rx_bad_buffers"]
 SERVER = "192.168.100.1"
+PASSPHRASE = "invirtio-hwsim"
+# The networks that wpa_supplicant joins, with its MFP setting for each. The
+# WPA2-PSK networks renew their pairwise key every 6 seconds and their group
+# key every 4.
+WPA_NETWORKS = [("hwsim-2g-wpa2", 0), ("hwsim-2g-wpa2-mfp", 2),
+                ("hwsim-5g-wpa2", 0), ("hwsim-5g-wpa2-mfp", 2),
+                ("hwsim-2g-wpa3-transition", 1)]
+REKEYED = {"hwsim-2g-wpa2", "hwsim-5g-wpa2"}
+# The networks that NetworkManager joins, and the name of its profile.
+NM_NETWORKS = [("hwsim-2g-wpa2", 0), ("hwsim-5g-wpa2", 0),
+               ("hwsim-5g-wpa2-mfp", 2)]
+NM_CONNECTION = "vwlan-test"
 # The lease adds only the address and its subnet's route, and no default
 # route.
 UDHCPC_SCRIPT = """#!/bin/sh
@@ -57,8 +74,13 @@ def check(cond, what):
     return cond
 
 
+# The output of nmcli and the other tools is matched in English.
+ENV = {**os.environ, "LC_ALL": "C"}
+
+
 def run(*args, check=False):
-    return subprocess.run(args, capture_output=True, text=True, check=check)
+    return subprocess.run(args, capture_output=True, text=True, check=check,
+                          env=ENV)
 
 
 class Guest:
@@ -150,6 +172,45 @@ def write(path, text):
         f.write(text)
 
 
+# The test's own calls never start the system wpa_supplicant.
+WPAS = ["busctl", "--auto-start=no", "call", "fi.w1.wpa_supplicant1",
+        "/fi/w1/wpa_supplicant1", "fi.w1.wpa_supplicant1"]
+
+
+def release_supplicant(net):
+    """The system wpa_supplicant keeps an interface that NetworkManager gave
+    it after the interface is removed, and takes over a new one with the same
+    name, so it is told to drop it. NetworkManager can still be handing it
+    the interface, so it must stay without it for a second. Return whether
+    it did."""
+    since = time.time()
+    end = since + 10
+    while time.time() < end:
+        r = run(*WPAS, "GetInterface", "s", net)
+        m = re.match(r'o "(\S+)"', r.stdout)
+        if m:
+            run(*WPAS, "RemoveInterface", "o", m.group(1))
+            since = time.time()
+        elif time.time() - since >= 1:
+            return True
+        time.sleep(0.2)
+    return False
+
+
+def unmanage(net):
+    """NetworkManager's wpa_supplicant ends connections that it did not make,
+    so the interface must be unmanaged before the test uses it. NetworkManager
+    can take a moment to know the interface. Return whether it is
+    unmanaged."""
+    for _ in range(50):
+        run("nmcli", "device", "set", net, "managed", "no")
+        r = run("nmcli", "-g", "GENERAL.STATE", "device", "show", net)
+        if "unmanaged" in r.stdout or "not running" in r.stderr:
+            return release_supplicant(net)
+        time.sleep(0.1)
+    return False
+
+
 def attach():
     """Add the device to the vDPA bus and return its wiphy and netdev."""
     run("vdpa", "dev", "add", "name", NAME, "mgmtdev", "vduse", check=True)
@@ -164,7 +225,7 @@ def attach():
         nets = glob.glob(f"/sys/bus/vdpa/devices/{NAME}/virtio*/net/*")
         if phys and nets:
             phy, net = os.path.basename(phys[0]), os.path.basename(nets[0])
-            run("nmcli", "device", "set", net, "managed", "no")
+            check(unmanage(net), f"NetworkManager leaves {net} alone")
             # A new wiphy starts blocked while the host's WiFi is switched off.
             for soft in glob.glob(f"/sys/class/ieee80211/{phy}/rfkill*/soft"):
                 write(soft, "0")
@@ -182,6 +243,21 @@ def counter(phy, name):
         return None
 
 
+def settled_counter(phy, name):
+    """Return a counter once it has not changed for a second. The guest
+    reports a disconnection after it has answered the command that asked
+    for it."""
+    value = counter(phy, name)
+    since = time.time()
+    end = since + 10
+    while time.time() - since < 1 and time.time() < end:
+        time.sleep(0.2)
+        now = counter(phy, name)
+        if now != value:
+            value, since = now, time.time()
+    return value
+
+
 def counters(phy):
     return {name: counter(phy, name) for name in COUNTERS}
 
@@ -190,20 +266,10 @@ def band_of(freq):
     return "2g" if freq < 3000 else "5g" if freq < 5935 else "6g"
 
 
-def scan(net):
-    """Return the SSID and frequency of each BSS that a scan finds. A scan
-    that NetworkManager started before the device became unmanaged makes
-    the first attempts fail with EBUSY."""
-    for _ in range(20):
-        r = run("timeout", "40", "iw", "dev", net, "scan")
-        if "(-16)" not in r.stderr:
-            break
-        time.sleep(1)
-    if r.returncode != 0:
-        print(f"iw scan failed with {r.returncode}: {r.stderr.strip()}")
+def parse_scan(text):
     found = {}
     bss = None
-    for line in r.stdout.splitlines():
+    for line in text.splitlines():
         m = re.match(r"BSS ([0-9a-f:]{17})", line)
         if m:
             bss = found.setdefault(m.group(1), {})
@@ -213,6 +279,27 @@ def scan(net):
         m = re.match(r"\s+SSID: (.*)", line)
         if m and bss is not None:
             bss["ssid"] = m.group(1)
+    return found
+
+
+def scan(net):
+    """Return the SSID and frequency of each BSS that a scan finds. A scan
+    of the system wpa_supplicant, which can start before the device is
+    unmanaged, makes the first attempts fail with EBUSY or end without
+    results, so a scan that finds nothing is tried again."""
+    empty = 0
+    for _ in range(20):
+        r = run("timeout", "40", "iw", "dev", net, "scan")
+        found = parse_scan(r.stdout)
+        if found:
+            return found
+        if "(-16)" not in r.stderr:
+            empty += 1
+            if empty == 3:
+                break
+        time.sleep(1)
+    print(f"iw scan returned {r.returncode}: {r.stderr.strip()} "
+          f"{r.stdout.strip()[:500]}")
     return found
 
 
@@ -242,7 +329,8 @@ class Events:
     """The output of iw event for the duration of a test."""
 
     def __init__(self):
-        self.proc = subprocess.Popen(["iw", "event"], stdout=subprocess.PIPE)
+        self.proc = subprocess.Popen(["iw", "event"], stdout=subprocess.PIPE,
+                                     env=ENV)
         self.fd = self.proc.stdout.fileno()
         os.set_blocking(self.fd, False)
         self.text = ""
@@ -260,6 +348,18 @@ class Events:
                 return m
             time.sleep(0.1)
         return None
+
+    def count(self, pattern):
+        """Return how many events so far match, without consuming them."""
+        try:
+            while True:
+                data = os.read(self.fd, 65536)
+                if not data:
+                    break
+                self.text += data.decode(errors="replace")
+        except BlockingIOError:
+            pass
+        return len(re.findall(pattern, self.text))
 
     def close(self):
         self.proc.kill()
@@ -299,8 +399,13 @@ def test_traffic(guest, net, out):
         check(r.returncode == 0 and m and m.group(1) == "5",
               f"ping {SERVER}: {m.group(0) if m else r.stdout + r.stderr}")
         for args, what in (((), "to"), (("-R",), "from")):
-            r = run("timeout", "30", "iperf3", "-c", SERVER, "--bind-dev",
-                    net, "-t", "3", "-J", *args)
+            # The server stops listening for a moment between tests.
+            for _ in range(5):
+                r = run("timeout", "30", "iperf3", "-c", SERVER, "--bind-dev",
+                        net, "-t", "3", "-J", *args)
+                if "Connection refused" not in r.stdout:
+                    break
+                time.sleep(1)
             try:
                 bps = json.loads(r.stdout)["end"]["sum_received"][
                     "bits_per_second"]
@@ -314,10 +419,151 @@ def test_traffic(guest, net, out):
         run("ip", "-4", "addr", "flush", "dev", net)
 
 
+def wpa_state(net, ctrl):
+    r = run("wpa_cli", "-p", ctrl, "-i", net, "status")
+    m = re.search(r"^wpa_state=(\w+)", r.stdout, re.M)
+    return m.group(1) if m else ""
+
+
+def test_wpa(guest, net, out, ssid, mfp):
+    """Join a network with wpa_supplicant and pass traffic. On a network that
+    renews its keys, wait for both to be renewed first."""
+    ctrl = os.path.join(out, "wpa")
+    conf = os.path.join(out, "wpa_supplicant.conf")
+    log = os.path.join(out, f"wpa-{ssid}.log")
+    # A network with required MFP also offers the SHA-256 PSK.
+    key_mgmt = "WPA-PSK WPA-PSK-SHA256" if mfp == 2 else "WPA-PSK"
+    with open(conf, "w") as f:
+        f.write(f"ctrl_interface={ctrl}\n"
+                f"network={{\n\tssid=\"{ssid}\"\n\tpsk=\"{PASSPHRASE}\"\n"
+                f"\tkey_mgmt={key_mgmt}\n\tieee80211w={mfp}\n}}\n")
+    with open(log, "w") as logf:
+        proc = subprocess.Popen(["wpa_supplicant", "-i", net, "-D", "nl80211",
+                                 "-c", conf], stdout=logf,
+                                stderr=subprocess.STDOUT, env=ENV)
+    joined = False
+    try:
+        end = time.time() + 30
+        while not joined and time.time() < end:
+            joined = wpa_state(net, ctrl) == "COMPLETED"
+            time.sleep(0.2)
+        if not check(joined, f"wpa_supplicant joins {ssid}"):
+            with open(log) as f:
+                print(f.read()[-3000:])
+            return
+        if ssid in REKEYED:
+            time.sleep(8)
+            with open(log) as f:
+                text = f.read()
+            # A rekey changes the state for a moment.
+            end = time.time() + 5
+            while (wpa_state(net, ctrl) != "COMPLETED" and
+                   time.time() < end):
+                time.sleep(0.2)
+            check(text.count("WPA: Key negotiation completed") >= 2 and
+                  "WPA: Group rekeying completed" in text and
+                  wpa_state(net, ctrl) == "COMPLETED",
+                  f"{ssid} renews its pairwise and group keys")
+            negotiated = text.count("WPA: Key negotiation completed")
+        test_traffic(guest, net, out)
+        # A message 4 that the access point does not accept still logs a
+        # completed negotiation, and ends in a deauthentication once the
+        # access point has given up resending message 3.
+        if ssid in REKEYED:
+            with open(log) as f:
+                text = f.read()
+            check(text.count("WPA: Key negotiation completed") > negotiated,
+                  f"{ssid} renews its pairwise key during the traffic")
+            time.sleep(5)
+        with open(log) as f:
+            text = f.read()
+        check(text.count("CTRL-EVENT-CONNECTED") == 1 and
+              "CTRL-EVENT-DISCONNECTED" not in text,
+              f"{ssid} stays connected throughout")
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+    end = time.time() + 10
+    while ("Not connected" not in run("iw", "dev", net, "link").stdout and
+           time.time() < end):
+        time.sleep(0.2)
+    check(not carrier(net) and
+          "Not connected" in run("iw", "dev", net, "link").stdout,
+          f"stopping wpa_supplicant disconnects from {ssid}")
+
+
+def test_nm(net, ssid, mfp):
+    """Have NetworkManager join a network through a profile of its own and
+    ping through it, then leave the interface unmanaged again. The profile
+    adds no default route and no DNS servers, and is not saved to disk."""
+    uuid = None
+    try:
+        run("nmcli", "device", "set", net, "managed", "yes")
+        end = time.time() + 10
+        while time.time() < end:
+            state = run("nmcli", "-g", "GENERAL.STATE", "device", "show",
+                        net).stdout
+            if "unavailable" not in state and "unmanaged" not in state:
+                break
+            time.sleep(0.2)
+        # NetworkManager only joins a network that its own scan has found.
+        end = time.time() + 30
+        while time.time() < end:
+            run("nmcli", "device", "wifi", "rescan", "ifname", net, "ssid",
+                ssid)
+            ssids = run("nmcli", "-g", "SSID", "device", "wifi", "list",
+                        "ifname", net).stdout.split()
+            if ssid in ssids:
+                break
+            time.sleep(2)
+        pmf = {0: "disable", 1: "optional", 2: "required"}[mfp]
+        # A killed run can leave a profile of the same name in memory, whose
+        # file is under /run.
+        for line in run("nmcli", "-t", "-f", "NAME,UUID,FILENAME",
+                        "connection", "show").stdout.splitlines():
+            name, old, filename = (line.split(":", 2) + ["", ""])[:3]
+            if name == NM_CONNECTION and filename.startswith("/run/"):
+                run("nmcli", "connection", "delete", "uuid", old)
+        r = run("nmcli", "connection", "add", "save", "no", "type", "wifi",
+            "ifname", net, "con-name", NM_CONNECTION, "ssid", ssid,
+            "wifi-sec.key-mgmt", "wpa-psk", "wifi-sec.psk", PASSPHRASE,
+            "wifi-sec.pmf", pmf, "connection.autoconnect", "no",
+            "ipv4.method", "auto", "ipv4.never-default", "yes",
+            "ipv4.ignore-auto-dns", "yes", "ipv6.method", "disabled")
+        m = re.search(r"\(([0-9a-f-]{36})\)", r.stdout)
+        uuid = m.group(1) if m else NM_CONNECTION
+        start = time.time()
+        r = run("nmcli", "--wait", "45", "connection", "up", "uuid", uuid)
+        addr = run("ip", "-4", "-br", "addr", "show", net).stdout.split()[2:]
+        if not check(r.returncode == 0 and addr,
+                     f"NetworkManager joins {ssid}: {' '.join(addr)}"):
+            print(r.stdout + r.stderr)
+            print(run("nmcli", "-f", "SSID,BSSID,FREQ,SECURITY", "device",
+                      "wifi", "list", "ifname", net).stdout)
+            print(run("journalctl", "-u", "NetworkManager", "-o", "cat",
+                      "--since", f"@{int(start) - 35}").stdout[-4000:])
+            return
+        r = run("ping", "-c", "5", "-i", "0.2", "-W", "2", "-I", net, SERVER)
+        m = re.search(r"(\d+) received", r.stdout)
+        check(r.returncode == 0 and m and m.group(1) == "5",
+              f"ping {SERVER} through NetworkManager's connection: "
+              f"{m.group(0) if m else r.stdout + r.stderr}")
+    finally:
+        if uuid:
+            run("nmcli", "connection", "down", "uuid", uuid)
+            run("nmcli", "connection", "delete", "uuid", uuid)
+        check(unmanage(net), f"NetworkManager leaves {net} alone again")
+        run("ip", "link", "set", net, "up")
+
+
 def test_scan_connect(guest, phy, net, out):
-    """Scan all three bands, then connect to open networks, pass traffic,
-    and leave the last connection up. Return the number of disconnections
-    that the host asked for."""
+    """Scan all three bands, then connect to open and WPA2 networks, pass
+    traffic, and leave the last connection up. Return the number of
+    disconnections that the host asked for."""
     r = run("ip", "link", "set", net, "up")
     if not check(r.returncode == 0, f"{net} comes up"):
         return 0
@@ -337,9 +583,12 @@ def test_scan_connect(guest, phy, net, out):
         for ssid in ("hwsim-2g-open", "hwsim-5g-open"):
             result = test_connect(events, net, ssid)
             link = run("iw", "dev", net, "link").stdout
-            check(result.startswith(f"{net}") and "connected to" in result
-                  and f"SSID: {ssid}" in link,
-                  f"connecting to {ssid}: {result}")
+            if not check(result.startswith(f"{net}") and
+                         "connected to" in result and f"SSID: {ssid}" in link,
+                         f"connecting to {ssid}: {result}"):
+                m = events.wait_for(rf"{net} \(phy #\d+\): disconnected[^\n]*",
+                                    1)
+                print(m.group(0) if m else "no disconnection event")
             sta = run("iw", "dev", net, "station", "dump")
             if not check("signal:" in sta.stdout,
                          "station dump shows the access point's signal"):
@@ -351,6 +600,31 @@ def test_scan_connect(guest, phy, net, out):
             check(m is not None and not carrier(net) and
                   "Not connected" in run("iw", "dev", net, "link").stdout,
                   f"disconnecting from {ssid} drops the carrier")
+        # wpa_supplicant and NetworkManager decide how often they
+        # disconnect, so the disconnections that the host asked for are
+        # counted from their events.
+        before = settled_counter(phy, "stale_events")
+        events.close()
+        events = Events()
+        for ssid, mfp in WPA_NETWORKS:
+            test_wpa(guest, net, out, ssid, mfp)
+        check((counter(phy, "control_port_frames") or 0) > 0 and
+              (counter(phy, "control_port_rx_frames") or 0) > 0,
+              "wpa_supplicant sends and receives EAPOL frames through the "
+              "control port")
+        for ssid, mfp in NM_NETWORKS:
+            test_nm(net, ssid, mfp)
+        after = settled_counter(phy, "stale_events")
+        local = events.count(rf"{net} \(phy #\d+\): disconnected "
+                             rf"\(local request\)")
+        check(before is not None and after is not None and
+              after - before == local,
+              f"the guest reports the {local} disconnections that "
+              f"wpa_supplicant and NetworkManager asked for, and no other")
+        disconnects += local
+        # The events of wpa_supplicant's connections are not the test's.
+        events.close()
+        events = Events()
         result = test_connect(events, net, "hwsim-missing")
         check("failed to connect" in result or "timed out" in result,
               f"connecting to a missing network fails: {result}")
@@ -429,6 +703,11 @@ def run_tests(guest, log_start):
           "the backend's drop counters are zero: " +
           ", ".join(f"{k} {v}" for k, v in stats.items()
                     if k.startswith(("tx_", "rx_"))))
+    # The hwsim guest sends a frame before dev_queue_xmit() returns, so only
+    # this counter shows that the backend completes control port frames from
+    # their destructor.
+    check(int(stats.get("tx_chained", "0")) > 0,
+          "the backend completes control port frames once they are sent")
 
     run("vdpa", "dev", "del", NAME, check=True)
     check(not os.path.exists(f"/sys/class/ieee80211/{phy}") and

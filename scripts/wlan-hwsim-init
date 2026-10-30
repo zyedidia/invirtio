@@ -59,7 +59,10 @@ EOF
 
 # The first network of a radio is open. The others are added with bss=
 # sections: WPA2-PSK, WPA2-PSK with required MFP, and the WPA2/WPA3
-# transition mode.
+# transition mode. The WPA2-PSK network renews its pairwise key and its
+# group key every few seconds. The network with required MFP also offers
+# the SHA-256 PSK, which is all that NetworkManager offers with required
+# MFP.
 ap_networks() {
 	cat <<EOF
 ssid=hwsim-$2-open
@@ -71,12 +74,14 @@ wpa=2
 wpa_key_mgmt=WPA-PSK
 rsn_pairwise=CCMP
 wpa_passphrase=$PASSPHRASE
+wpa_ptk_rekey=6
+wpa_group_rekey=4
 
 bss=$1-2
 bridge=br0
 ssid=hwsim-$2-wpa2-mfp
 wpa=2
-wpa_key_mgmt=WPA-PSK
+wpa_key_mgmt=WPA-PSK WPA-PSK-SHA256
 rsn_pairwise=CCMP
 ieee80211w=2
 wpa_passphrase=$PASSPHRASE
