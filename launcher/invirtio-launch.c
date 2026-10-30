@@ -9,7 +9,9 @@
  * and a seccomp filter. The launcher then supervises the guest: it asks the
  * guest to stop on SIGINT, SIGTERM or SIGHUP, kills a guest that does not
  * stop in time, relays the guest's console and its management console,
- * steers the devices' host interrupts and can restart the guest.
+ * steers the devices' host interrupts and can restart the guest. The launcher
+ * keeps the VDUSE control device to itself, and creates, destroys and opens
+ * the VDUSE devices that the guest exports when the guest asks.
  */
 #define _GNU_SOURCE
 #include <ctype.h>
@@ -34,8 +36,12 @@
 #include <linux/audit.h>
 #include <linux/filter.h>
 #include <linux/landlock.h>
+#include <linux/magic.h>
 #include <linux/seccomp.h>
+#include <linux/vduse.h>
 #include <linux/vfio.h>
+#include <linux/virtio_ids.h>
+#include <sys/file.h>
 #include <sys/ioctl.h>
 #include <sys/mount.h>
 #include <sys/personality.h>
@@ -46,10 +52,12 @@
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/un.h>
+#include <sys/vfs.h>
 #include <termios.h>
 #include <sys/wait.h>
 
 #define MAX_DEVICES 8
+#define MAX_EXPORTS 8
 #define MAX_ARGS 256
 
 struct device {
@@ -61,10 +69,37 @@ struct device {
 	int rom_fd;
 };
 
+/* A VDUSE device that the guest exports, and its in-flight log. */
+struct export {
+	const char *type;
+	uint32_t device_id;
+	const char *name;
+	const char *log_path;
+	int log_fd;
+	/* The log's size when it was opened, or as the guest last set it. */
+	off_t log_size;
+};
+
+static const struct {
+	const char *type;
+	uint32_t device_id;
+} export_types[] = {
+	{ "blk", VIRTIO_ID_BLOCK },
+	{ "net", VIRTIO_ID_NET },
+	{ "wlan", VIRTIO_ID_MAC80211_WLAN },
+};
+
 static const char *prog = "invirtio-launch";
 
 static struct device devices[MAX_DEVICES];
 static int nr_devices;
+static struct export exports[MAX_EXPORTS];
+static int nr_exports;
+/* The VDUSE control device, which the guest never holds. */
+static int vduse_control = -1;
+static dev_t vduse_control_rdev;
+/* The VDUSE requests that the guest has sent in this run. */
+static unsigned int broker_requests;
 static bool bind_devices;
 static const char *initrd_path;
 static const char *user;
@@ -85,14 +120,14 @@ static void usage(void)
 "usage: %s [options] <uml binary> [uml arguments...]\n"
 "\n"
 "Run a UML driver guest as an unprivileged user. The launcher opens the\n"
-"VFIO container and groups, any ROM images, the initramfs and /proc/cpuinfo,\n"
-"and passes them to UML as file descriptors, along with the memfd,\n"
-"no_uml_dir, seccomp=on and sandbox options. The guest runs in new mount,\n"
-"network, IPC and PID namespaces with an empty root, under Landlock and a\n"
-"seccomp filter. When the launcher's stdin is a terminal, the guest gets a\n"
-"pty of its own that the launcher relays to that terminal, so that the\n"
-"guest does not hold it. Otherwise the guest inherits the launcher's stdin\n"
-"and stdout.\n"
+"VFIO container and groups, any ROM images, the initramfs, /proc/cpuinfo and\n"
+"the in-flight logs of exported devices, and passes them to UML as file\n"
+"descriptors, along with the memfd, no_uml_dir, seccomp=on and sandbox\n"
+"options. The guest runs in new mount, network, IPC and PID namespaces with\n"
+"an empty root, under Landlock and a seccomp filter. When the launcher's\n"
+"stdin is a terminal, the guest gets a pty of its own that the launcher\n"
+"relays to that terminal, so that the guest does not hold it. Otherwise the\n"
+"guest inherits the launcher's stdin and stdout.\n"
 "\n"
 "  -u <user>     run the guest as this user, given as a name or uid[:gid]\n"
 "  -d <address>[,rom=<file>]\n"
@@ -100,6 +135,13 @@ static void usage(void)
 "                rom, the guest sees the image in <file> as the device's\n"
 "                expansion ROM. Can be repeated\n"
 "  -b            bind the devices to vfio-pci if they are not bound to it\n"
+"  -e <type>,<name>,log=<file>\n"
+"                let the guest export the VDUSE device <name> of type blk,\n"
+"                net or wlan, with its in-flight log in <file>. The guest's\n"
+"                vduse_guest.device=<type>,<name> argument gets the log as\n"
+"                log_fd=<n>. <file> must be on a tmpfs, whose size bounds\n"
+"                what the guest can write to it. A name must be exported\n"
+"                by one launcher only. Can be repeated\n"
 "  -i <file>     the initramfs, passed as initrd=fd:<n>\n"
 "  -l <MiB>      the guest's RLIMIT_MEMLOCK, which bounds the DMA memory that\n"
 "                each of its processes pins (default 256)\n"
@@ -115,7 +157,15 @@ static void usage(void)
 "A SIGINT, SIGTERM or SIGHUP to the launcher asks the guest to power off in\n"
 "order, and a second one kills it, as does the launcher's own death. On a\n"
 "terminal the guest's console is a pty, so Ctrl-C reaches the guest, not the\n"
-"launcher, which is stopped with a signal instead.\n",
+"launcher, which is stopped with a signal instead.\n"
+"\n"
+"The launcher creates, destroys and opens the exported devices when the guest\n"
+"asks, so the guest never holds /dev/vduse/control. When the guest exits, the\n"
+"launcher destroys each exported device that is not on the host's vDPA bus.\n"
+"Attaching a device with 'vdpa dev add' and removing it are left to the\n"
+"caller. With -e, the UML arguments before any '--' may not hold spaces,\n"
+"quotes, control characters or bytes from 0x7f up, since the kernel could\n"
+"split such an argument in two.\n",
 		prog);
 	exit(2);
 }
@@ -433,11 +483,167 @@ static void parse_user(const char *s)
 		die("the guest must not run in the root group");
 }
 
+/* Parse -e <type>,<name>,log=<file>. */
+static void parse_export(char *arg)
+{
+	struct export *e = &exports[nr_exports];
+	char *name, *log;
+	size_t i, n = sizeof(export_types) / sizeof(export_types[0]);
+	int j;
+
+	if (nr_exports == MAX_EXPORTS)
+		die("at most %d devices can be exported", MAX_EXPORTS);
+	name = strchr(arg, ',');
+	log = name ? strchr(name + 1, ',') : NULL;
+	if (!log || strncmp(log + 1, "log=", 4) || !log[5])
+		die("cannot parse -e %s", arg);
+	*name++ = '\0';
+	*log = '\0';
+	e->type = arg;
+	e->name = name;
+	e->log_path = log + 5;
+
+	for (i = 0; i < n && strcmp(export_types[i].type, arg); i++)
+		;
+	if (i == n)
+		die("cannot export a device of type '%s'", arg);
+	e->device_id = export_types[i].device_id;
+
+	/*
+	 * The launcher opens /dev/vduse/<name>, which must not be the control
+	 * device.
+	 */
+	if (!name[0] || strlen(name) >= VDUSE_NAME_MAX || strchr(name, '/') ||
+	    !strcmp(name, ".") || !strcmp(name, "..") ||
+	    !strcmp(name, "control"))
+		die("'%s' is not a valid VDUSE device name", name);
+	for (j = 0; j < nr_exports; j++) {
+		if (!strcmp(exports[j].name, name))
+			die("the device %s is exported twice", name);
+	}
+	nr_exports++;
+}
+
+#define DEVICE_PARAM "vduse_guest.device"
+#define BROKER_PARAM "vduse_uml.broker_fd"
+
+/*
+ * Return whether arg sets the kernel parameter name. The kernel takes '-'
+ * and '_' in parameter names as equal.
+ */
+static bool is_param(const char *arg, const char *name)
+{
+	for (; *name; arg++, name++) {
+		if (*arg == *name)
+			continue;
+		if ((*arg != '-' && *arg != '_') || (*name != '-' && *name != '_'))
+			return false;
+	}
+	return *arg == '=';
+}
+
+/*
+ * Return the export that a vduse_guest.device=<type>,<name>[,<options>]
+ * argument gives, or NULL.
+ */
+static struct export *arg_export(const char *arg)
+{
+	const char *type = arg + strlen(DEVICE_PARAM "="), *name, *end;
+	size_t type_len, name_len;
+	int i;
+
+	name = strchr(type, ',');
+	if (!name)
+		return NULL;
+	type_len = name++ - type;
+	end = strchrnul(name, ',');
+	name_len = end - name;
+	for (i = 0; i < nr_exports; i++) {
+		if (strlen(exports[i].type) == type_len &&
+		    !strncmp(exports[i].type, type, type_len) &&
+		    strlen(exports[i].name) == name_len &&
+		    !strncmp(exports[i].name, name, name_len))
+			return &exports[i];
+	}
+	return NULL;
+}
+
+/*
+ * Return whether s has a byte on which the kernel could split it into more
+ * arguments, since UML joins its arguments into one command line. The
+ * kernel's isspace() also matches control characters and byte 0xa0.
+ */
+static bool splits_args(const char *s)
+{
+	const unsigned char *c;
+
+	for (c = (const unsigned char *)s; *c; c++) {
+		if (*c <= ' ' || *c >= 0x7f || *c == '"')
+			return true;
+	}
+	return false;
+}
+
+/*
+ * Check that every vduse_guest.device= argument before a "--" gives an
+ * exported device with its type and no log, which the launcher adds, and that
+ * every exported device has one. The launcher also passes the broker's fd
+ * itself, and an argument with a space or a quote could hide a parameter
+ * from these checks.
+ */
+static void check_device_args(int argc, char **argv)
+{
+	bool given[MAX_EXPORTS] = { false };
+	struct export *e;
+	int i;
+
+	for (i = 1; i < argc && strcmp(argv[i], "--"); i++) {
+		if (nr_exports && splits_args(argv[i]))
+			die("'%s' has a space, a quote or a control character, which could give the kernel another argument",
+			    argv[i]);
+		if (is_param(argv[i], BROKER_PARAM))
+			die("'%s' gives the broker's fd, which the launcher passes",
+			    argv[i]);
+		if (!is_param(argv[i], DEVICE_PARAM))
+			continue;
+		e = arg_export(argv[i]);
+		if (!e)
+			die("'%s' gives no device that -e exports with that type",
+			    argv[i]);
+		if (given[e - exports])
+			die("the device %s is given twice", e->name);
+		given[e - exports] = true;
+		if (strstr(argv[i], ",log=") || strstr(argv[i], ",log_fd="))
+			die("'%s' gives a log, which the launcher passes", argv[i]);
+	}
+	for (i = 0; i < nr_exports; i++) {
+		if (!given[i])
+			die("no %s=%s,%s argument gives the exported device",
+			    DEVICE_PARAM, exports[i].type, exports[i].name);
+	}
+}
+
+static void open_vduse_control(void)
+{
+	uint64_t version = 0;
+	struct stat st;
+
+	vduse_control = open("/dev/vduse/control", O_RDWR | O_CLOEXEC);
+	if (vduse_control < 0)
+		die("cannot open /dev/vduse/control, is vduse loaded? %s",
+		    strerror(errno));
+	if (ioctl(vduse_control, VDUSE_SET_API_VERSION, &version) < 0)
+		die("cannot set the VDUSE API version: %s", strerror(errno));
+	if (fstat(vduse_control, &st) < 0)
+		die("cannot stat /dev/vduse/control: %s", strerror(errno));
+	vduse_control_rdev = st.st_rdev;
+}
+
 /*
  * The file descriptors that one run of the guest receives, and the mconsole
- * sockets that the launcher keeps. The guest's mconsole socket is a
- * seqpacket pair, which ignores destination addresses, so that the guest
- * cannot send datagrams to other sockets through it.
+ * and VDUSE broker sockets that the launcher keeps. The guest's mconsole
+ * socket is a seqpacket pair, which ignores destination addresses, so that
+ * the guest cannot send datagrams to other sockets through it.
  */
 struct guest_fds {
 	int container;
@@ -446,6 +652,8 @@ struct guest_fds {
 	int mconsole_guest;
 	int mconsole;
 	int mconsole_relay;
+	int broker_guest;
+	int broker;
 };
 
 static int open_fd(const char *path, int flags)
@@ -486,6 +694,72 @@ static int bind_mconsole(const char *path)
 }
 
 /*
+ * The log must outlive the guest, and the guest maps it. A log on a tmpfs
+ * lasts as long as the VDUSE devices, until the host reboots. The guest can
+ * write to the file without bound, and the tmpfs's size bounds it, while a
+ * disk would fill. A log that does not exist yet is checked by its directory.
+ */
+static int on_tmpfs(const char *path)
+{
+	char dir[PATH_MAX], *slash;
+	struct statfs sfs;
+
+	if (statfs(path, &sfs) == 0)
+		return sfs.f_type == TMPFS_MAGIC;
+	if (errno != ENOENT)
+		return -errno;
+	snprintf(dir, sizeof(dir), "%s", path);
+	slash = strrchr(dir, '/');
+	if (!slash)
+		strcpy(dir, ".");
+	else if (slash == dir)
+		dir[1] = '\0';
+	else
+		*slash = '\0';
+	if (statfs(dir, &sfs) < 0)
+		return -errno;
+	return sfs.f_type == TMPFS_MAGIC;
+}
+
+static void open_log(struct export *e)
+{
+	struct timespec pause = { .tv_nsec = 10 * 1000 * 1000 };
+	const char *path = e->log_path;
+	struct statfs sfs;
+	struct stat st;
+	int fd, n;
+
+	fd = open(path, O_RDWR | O_CREAT | O_NOFOLLOW, 0600);
+	if (fd < 0)
+		die("cannot open %s: %s", path, strerror(errno));
+	if (fstat(fd, &st) < 0 || !S_ISREG(st.st_mode))
+		die("the in-flight log %s is not a regular file", path);
+	if (fstatfs(fd, &sfs) < 0 || sfs.f_type != TMPFS_MAGIC)
+		die("the in-flight log %s is not on a tmpfs", path);
+	/* A log that another user created or linked could be changed by them. */
+	if (st.st_uid != 0 || st.st_nlink != 1)
+		die("the in-flight log %s must belong to root and have one link",
+		    path);
+	if (fchmod(fd, 0600) < 0)
+		die("cannot set the mode of %s: %s", path, strerror(errno));
+	/*
+	 * One device's destroy empties its log under any other mapping of it.
+	 * The guest inherits the lock with the file, so another device cannot
+	 * take the log while a guest still maps it. The earlier guest can leave
+	 * the log's fd in a cycle of Unix sockets, which the kernel frees soon
+	 * after the guest is gone, so the lock is tried for a second.
+	 */
+	for (n = 0; flock(fd, LOCK_EX | LOCK_NB) < 0; n++) {
+		if (n == 100)
+			die("the in-flight log %s is in use by another device",
+			    path);
+		nanosleep(&pause, NULL);
+	}
+	e->log_fd = fd;
+	e->log_size = st.st_size;
+}
+
+/*
  * Open everything the guest needs. The guest's descriptors are inherited
  * across exec, and the parent closes its copies once the guest has started.
  * The mconsole sockets that the parent keeps are close-on-exec.
@@ -495,9 +769,13 @@ static void open_guest_fds(struct guest_fds *fds)
 	struct vfio_group_status status = { .argsz = sizeof(status) };
 	int i, j;
 
-	fds->container = open_fd("/dev/vfio/vfio", O_RDWR);
-	if (ioctl(fds->container, VFIO_GET_API_VERSION) != VFIO_API_VERSION)
-		die("/dev/vfio/vfio has an unknown VFIO API version");
+	fds->container = -1;
+	if (nr_devices) {
+		fds->container = open_fd("/dev/vfio/vfio", O_RDWR);
+		if (ioctl(fds->container, VFIO_GET_API_VERSION) !=
+		    VFIO_API_VERSION)
+			die("/dev/vfio/vfio has an unknown VFIO API version");
+	}
 
 	for (i = 0; i < nr_devices; i++) {
 		char path[64];
@@ -542,13 +820,31 @@ static void open_guest_fds(struct guest_fds *fds)
 		fds->mconsole_relay = pair[0];
 		fds->mconsole_guest = pair[1];
 	}
+
+	for (i = 0; i < nr_exports; i++)
+		open_log(&exports[i]);
+	broker_requests = 0;
+	fds->broker = -1;
+	fds->broker_guest = -1;
+	if (nr_exports) {
+		int pair[2];
+
+		if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0,
+			       pair) < 0 ||
+		    fcntl(pair[1], F_SETFD, 0) < 0)
+			die("cannot create the guest's VDUSE socket: %s",
+			    strerror(errno));
+		fds->broker = pair[0];
+		fds->broker_guest = pair[1];
+	}
 }
 
 static void close_guest_fds(struct guest_fds *fds)
 {
 	int i, j;
 
-	close(fds->container);
+	if (fds->container >= 0)
+		close(fds->container);
 	for (i = 0; i < nr_devices; i++) {
 		if (devices[i].rom_fd >= 0)
 			close(devices[i].rom_fd);
@@ -564,6 +860,8 @@ static void close_guest_fds(struct guest_fds *fds)
 	close(fds->cpuinfo);
 	if (fds->mconsole_guest >= 0)
 		close(fds->mconsole_guest);
+	if (fds->broker_guest >= 0)
+		close(fds->broker_guest);
 }
 
 static char *format(const char *fmt, ...)
@@ -585,9 +883,10 @@ static char *format(const char *fmt, ...)
 static char **guest_argv(int argc, char **argv, struct guest_fds *fds)
 {
 	static char *args[MAX_ARGS];
+	bool init_args = false;
 	int i, n = 0;
 
-	if (argc + nr_devices + 10 > MAX_ARGS)
+	if (argc + nr_devices + 11 > MAX_ARGS)
 		die("too many arguments");
 
 	args[n++] = argv[0];
@@ -611,8 +910,17 @@ static char **guest_argv(int argc, char **argv, struct guest_fds *fds)
 			args[n++] = format("vfio_uml.device=%s,group_fd=%d",
 					   devices[i].addr, devices[i].group_fd);
 	}
-	for (i = 1; i < argc; i++)
-		args[n++] = argv[i];
+	if (fds->broker_guest >= 0)
+		args[n++] = format(BROKER_PARAM "=%d", fds->broker_guest);
+	for (i = 1; i < argc; i++) {
+		if (!strcmp(argv[i], "--"))
+			init_args = true;
+		if (!init_args && is_param(argv[i], DEVICE_PARAM))
+			args[n++] = format("%s,log_fd=%d", argv[i],
+					   arg_export(argv[i])->log_fd);
+		else
+			args[n++] = argv[i];
+	}
 	args[n] = NULL;
 	return args;
 }
@@ -870,6 +1178,8 @@ static void guest_init(char **args, int alive[2])
 	/* The launcher may have the same pid in its own namespace. */
 	launcher_pid = 0;
 	close(alive[1]);
+	if (vduse_control >= 0)
+		close(vduse_control);
 
 	if (cgroup_dir) {
 		snprintf(path, sizeof(path), "%s/cgroup.procs", cgroup_dir);
@@ -1160,9 +1470,269 @@ static void relay_reply(struct relay *r, short revents)
 }
 
 /*
+ * A request from the guest's VDUSE transport, in the layout that UML's
+ * vduse_user.c defines. The guest cannot truncate files, so it asks the
+ * launcher to resize the in-flight log. A create request is followed by the
+ * configuration space. Each request gets an errno value, zero or negative, in
+ * reply, and the reply to an open request carries the device fd.
+ */
+enum {
+	BROKER_CREATE = 1,
+	BROKER_DESTROY,
+	BROKER_OPEN,
+	BROKER_RESIZE_LOG,
+};
+
+struct broker_request {
+	uint32_t op;
+	uint32_t device_id;
+	uint32_t vq_num;
+	uint32_t vq_align;
+	uint64_t features;
+	uint64_t log_size;
+	uint32_t config_size;
+	uint32_t reserved;
+	char name[VDUSE_NAME_MAX];
+};
+
+/* VDUSE takes at most a page of configuration space. */
+#define BROKER_MAX_CONFIG 4096
+
+/*
+ * VDUSE allocates host memory for each queue, which no cgroup of the guest
+ * is charged for. The guest's backends use at most this many.
+ */
+#define BROKER_MAX_QUEUES 64
+
+/*
+ * The largest in-flight log that the core lays out: a 32-byte header, and
+ * for each queue a 16-byte header and 16 bytes for each of at most 32768
+ * descriptors.
+ */
+#define BROKER_MAX_LOG (32 + BROKER_MAX_QUEUES * (16 + 16 * 32768ULL))
+
+/*
+ * Each run of the guest creates, destroys and opens each device a few
+ * times, and every create and destroy also adds and removes sysfs entries
+ * and sends uevents, so a run gets this many requests per exported device.
+ * The launcher stops reading the guest's requests once they are used up.
+ */
+#define BROKER_MAX_REQUESTS 16
+
+static struct export *find_export(const char *name)
+{
+	int i;
+
+	for (i = 0; i < nr_exports; i++) {
+		if (!strcmp(exports[i].name, name))
+			return &exports[i];
+	}
+	return NULL;
+}
+
+/*
+ * The launcher fills in the device's configuration itself, so that fields of
+ * newer VDUSE versions stay zero.
+ */
+static int vduse_create(const struct export *e,
+			const struct broker_request *req, const uint8_t *config)
+{
+	struct vduse_dev_config *cfg;
+	int err = 0;
+
+	cfg = calloc(1, sizeof(*cfg) + req->config_size);
+	if (!cfg)
+		return -ENOMEM;
+	strcpy(cfg->name, e->name);
+	cfg->device_id = e->device_id;
+	cfg->features = req->features;
+	cfg->vq_num = req->vq_num;
+	cfg->vq_align = req->vq_align;
+	cfg->config_size = req->config_size;
+	memcpy(cfg->config, config, req->config_size);
+	if (ioctl(vduse_control, VDUSE_CREATE_DEV, cfg) < 0)
+		err = -errno;
+	free(cfg);
+	return err;
+}
+
+static int vduse_destroy(const char *name)
+{
+	char buf[VDUSE_NAME_MAX] = { 0 };
+
+	strcpy(buf, name);
+	if (ioctl(vduse_control, VDUSE_DESTROY_DEV, buf) < 0)
+		return -errno;
+	return 0;
+}
+
+static int vduse_open(const char *name, int *fd)
+{
+	char path[sizeof("/dev/vduse/") + VDUSE_NAME_MAX];
+	struct stat st;
+
+	snprintf(path, sizeof(path), "/dev/vduse/%s", name);
+	*fd = open(path, O_RDWR | O_NONBLOCK | O_CLOEXEC);
+	if (*fd < 0)
+		return -errno;
+	/* Only a device node other than the control device goes to the guest. */
+	if (fstat(*fd, &st) < 0 || !S_ISCHR(st.st_mode) ||
+	    st.st_rdev == vduse_control_rdev) {
+		close(*fd);
+		*fd = -1;
+		return -EPERM;
+	}
+	return 0;
+}
+
+/*
+ * Carry out a request of len bytes. The guest may only create, destroy and
+ * open the devices that it exports, with their types.
+ */
+static int handle_request(const struct broker_request *req,
+			  const uint8_t *config, size_t len, int *fd)
+{
+	struct export *e;
+
+	if (len < sizeof(*req) || !memchr(req->name, '\0', sizeof(req->name)))
+		return -EINVAL;
+	e = find_export(req->name);
+	if (!e)
+		return -EPERM;
+
+	switch (req->op) {
+	case BROKER_CREATE:
+		if (req->device_id != e->device_id)
+			return -EPERM;
+		if (req->reserved || len != sizeof(*req) + req->config_size ||
+		    !req->vq_num || req->vq_num > BROKER_MAX_QUEUES)
+			return -EINVAL;
+		/*
+		 * The host's virtio driver lays out the rings with this
+		 * alignment, and VDUSE accepts zero and values that are not
+		 * powers of two, which break the layout. UML aligns its queues
+		 * to a page.
+		 */
+		if (req->vq_align != (uint32_t)sysconf(_SC_PAGESIZE))
+			return -EINVAL;
+		return vduse_create(e, req, config);
+	case BROKER_DESTROY:
+		if (len != sizeof(*req))
+			return -EINVAL;
+		return vduse_destroy(e->name);
+	case BROKER_OPEN:
+		if (len != sizeof(*req))
+			return -EINVAL;
+		return vduse_open(e->name, fd);
+	case BROKER_RESIZE_LOG:
+		if (len != sizeof(*req) || req->log_size > BROKER_MAX_LOG)
+			return -EINVAL;
+		if (ftruncate(e->log_fd, req->log_size) < 0)
+			return -errno;
+		e->log_size = req->log_size;
+		return 0;
+	}
+	return -EINVAL;
+}
+
+/*
+ * Answer one request from the guest. Return false once it has hung up, has
+ * used up its requests, or cannot take a reply.
+ */
+static bool serve_broker(int sock)
+{
+	struct {
+		struct broker_request req;
+		uint8_t config[BROKER_MAX_CONFIG];
+	} m;
+	union {
+		char buf[CMSG_SPACE(sizeof(int))];
+		struct cmsghdr align;
+	} control = { 0 };
+	struct iovec iov;
+	struct msghdr msg = { .msg_iov = &iov, .msg_iovlen = 1 };
+	struct cmsghdr *cmsg;
+	int32_t err;
+	int fd = -1;
+	ssize_t n;
+
+	/* With MSG_TRUNC, n is the length of the whole request. */
+	n = recv(sock, &m, sizeof(m), MSG_DONTWAIT | MSG_TRUNC);
+	if (n < 0)
+		return errno == EAGAIN || errno == EINTR;
+	if (n == 0)
+		return false;
+	if (++broker_requests > (unsigned int)nr_exports * BROKER_MAX_REQUESTS) {
+		warn("the guest sent too many VDUSE requests, the launcher stops answering them");
+		return false;
+	}
+
+	if ((size_t)n > sizeof(m))
+		err = -EINVAL;
+	else
+		err = handle_request(&m.req, m.config, n, &fd);
+
+	iov = (struct iovec){ .iov_base = &err, .iov_len = sizeof(err) };
+	if (fd >= 0) {
+		msg.msg_control = control.buf;
+		msg.msg_controllen = sizeof(control.buf);
+		cmsg = CMSG_FIRSTHDR(&msg);
+		cmsg->cmsg_level = SOL_SOCKET;
+		cmsg->cmsg_type = SCM_RIGHTS;
+		cmsg->cmsg_len = CMSG_LEN(sizeof(int));
+		memcpy(CMSG_DATA(cmsg), &fd, sizeof(int));
+	}
+	n = sendmsg(sock, &msg, MSG_DONTWAIT | MSG_NOSIGNAL);
+	if (fd >= 0)
+		close(fd);
+	return n >= 0;
+}
+
+/*
+ * Destroy the exported devices that the guest left behind, and close their
+ * logs. A device that is on the host's vDPA bus, or that another process
+ * opened, cannot be destroyed, and stays with its log for the next guest.
+ * The guest can leave a device's fd in a cycle of its own Unix sockets,
+ * which the kernel frees only after the guest is gone, so a device that is
+ * not on the bus is tried for a second. The log of a device that is gone
+ * describes nothing, and is emptied. The guest can write past the end of
+ * the log, so a log that stays is cut back to the size the guest set.
+ */
+static void destroy_exports(void)
+{
+	struct timespec pause = { .tv_nsec = 10 * 1000 * 1000 };
+	char path[sizeof("/sys/bus/vdpa/devices/") + VDUSE_NAME_MAX];
+	int i, n, err;
+	off_t size;
+
+	for (i = 0; i < nr_exports; i++) {
+		snprintf(path, sizeof(path), "/sys/bus/vdpa/devices/%s",
+			 exports[i].name);
+		for (n = 0; n < 100; n++) {
+			err = vduse_destroy(exports[i].name);
+			if (err != -EBUSY || access(path, F_OK) == 0)
+				break;
+			nanosleep(&pause, NULL);
+		}
+		if (!err)
+			warn("destroyed the device %s, which the guest left behind",
+			     exports[i].name);
+		else if (err == -EBUSY)
+			warn("the device %s stays, since it is in use",
+			     exports[i].name);
+		size = !err || err == -EINVAL ? 0 : exports[i].log_size;
+		if (ftruncate(exports[i].log_fd, size) < 0)
+			warn("cannot resize the in-flight log %s: %s",
+			     exports[i].log_path, strerror(errno));
+		close(exports[i].log_fd);
+	}
+}
+
+/*
  * Wait for the guest to exit and return its wait status. The stop signals
  * that the caller does not ignore are blocked in the launcher and handled
- * here, and mconsole requests are relayed to the guest.
+ * here, mconsole requests are relayed to the guest, and the guest's VDUSE
+ * requests are answered.
  */
 static int supervise(pid_t pid, struct guest_fds *fds)
 {
@@ -1171,7 +1741,8 @@ static int supervise(pid_t pid, struct guest_fds *fds)
 		.guest = fds->mconsole_relay,
 	};
 	struct signalfd_siginfo si;
-	struct pollfd poll_fds[3];
+	struct pollfd poll_fds[4];
+	int broker = fds->broker;
 	double deadline = 0, next_steer = 0;
 	int status, sfd;
 	sigset_t set;
@@ -1213,8 +1784,15 @@ static int supervise(pid_t pid, struct guest_fds *fds)
 			.fd = relay.waiting ? -1 : relay.host,
 			.events = POLLIN,
 		};
-		if (poll(poll_fds, 3, 200) <= 0)
+		poll_fds[3] = (struct pollfd){ .fd = broker, .events = POLLIN };
+		if (poll(poll_fds, 4, 200) <= 0)
 			continue;
+
+		/* A shut down socket fails the guest's next request at once. */
+		if (poll_fds[3].revents && !serve_broker(broker)) {
+			shutdown(broker, SHUT_RDWR);
+			broker = -1;
+		}
 
 		if (poll_fds[1].revents & POLLIN) {
 			relay_reply(&relay, poll_fds[1].revents);
@@ -1482,7 +2060,10 @@ static int run_guest(int argc, char **argv)
 		close(fds.mconsole);
 		close(fds.mconsole_relay);
 	}
+	if (fds.broker >= 0)
+		close(fds.broker);
 	kill_orphans();
+	destroy_exports();
 	if (WIFEXITED(status))
 		return WEXITSTATUS(status);
 	warn("the guest was killed by signal %d", WTERMSIG(status));
@@ -1506,7 +2087,7 @@ int main(int argc, char **argv)
 	close_range(3, ~0U, 0);
 	start_message_thread();
 
-	while ((opt = getopt(argc, argv, "+u:d:bi:l:g:s:a:t:rh")) != -1) {
+	while ((opt = getopt(argc, argv, "+u:d:be:i:l:g:s:a:t:rh")) != -1) {
 		switch (opt) {
 		case 'u':
 			user = optarg;
@@ -1527,6 +2108,9 @@ int main(int argc, char **argv)
 			break;
 		case 'b':
 			bind_devices = true;
+			break;
+		case 'e':
+			parse_export(optarg);
 			break;
 		case 'i':
 			initrd_path = optarg;
@@ -1563,6 +2147,18 @@ int main(int argc, char **argv)
 		die("must run as root");
 
 	parse_user(user);
+	check_device_args(argc - optind, argv + optind);
+	for (i = 0; i < nr_exports; i++) {
+		ret = on_tmpfs(exports[i].log_path);
+		if (ret < 0)
+			die("cannot find the filesystem of %s: %s",
+			    exports[i].log_path, strerror(-ret));
+		if (!ret)
+			die("the in-flight log %s is not on a tmpfs",
+			    exports[i].log_path);
+	}
+	if (nr_exports)
+		open_vduse_control();
 	for (i = 0; i < nr_devices; i++)
 		setup_device(&devices[i]);
 	uml_fd = open_fd(argv[optind], O_RDONLY | O_CLOEXEC);
