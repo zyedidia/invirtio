@@ -34,10 +34,13 @@ DEV=/sys/bus/pci/devices/$ADDR
 [ -d "$DEV" ] || { echo "$PROG: no such PCI device: $ADDR" >&2; exit 1; }
 [ "$(id -u)" -eq 0 ] || { echo "$PROG: must run as root" >&2; exit 1; }
 
+# readlink -f prints a path for a missing link too, so the link is checked
+# first.
 driver_of() {
-    local d
-    d=$(readlink -f "/sys/bus/pci/devices/$1/driver" 2>/dev/null) || return 0
-    [ -n "$d" ] && basename "$d"
+    local link=/sys/bus/pci/devices/$1/driver d
+    [ -e "$link" ] || return 0
+    d=$(readlink -f "$link") || return 0
+    basename "$d"
 }
 
 CURRENT=$(driver_of "$ADDR")
