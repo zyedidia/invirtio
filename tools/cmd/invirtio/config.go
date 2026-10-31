@@ -65,7 +65,7 @@ type Config struct {
 
 var defaultMemory = map[string]string{
 	"wlan": "768M",
-	"net":  "1G",
+	"net":  "256M",
 }
 
 func (d *Device) memory() string {
