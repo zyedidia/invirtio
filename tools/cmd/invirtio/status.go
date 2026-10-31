@@ -17,7 +17,7 @@ import (
 
 func cmdStatus(args []string) error {
 	fs := flag.NewFlagSet("status", flag.ExitOnError)
-	verbose := fs.Bool("v", false, "also show the guest's VDUSE counters, which needs root")
+	verbose := fs.Bool("v", false, "also show the guest's memory in detail and its VDUSE counters, which needs root")
 	fs.Usage = func() {
 		fmt.Fprintln(os.Stderr, "usage: invirtio status [-v] [<name>]\n\nShow the state of the enabled devices, or of one.")
 		fs.PrintDefaults()
@@ -110,11 +110,29 @@ func showDevice(name string, dev *Device, verbose bool) {
 		row("host interface", fmt.Sprintf("%s (%s)", n, oper))
 	}
 
+	cg := guestCgroup(unit)
+	if cg == "" {
+		row("memory", "no guest runs")
+	} else {
+		row("memory", memoryUse(cg))
+	}
+
 	if !verbose {
 		return
 	}
-	// The guest writes the counters and any error, so only printable text
-	// of theirs reaches the terminal.
+	if cg != "" {
+		row("memory detail", memoryDetail(cg))
+		if pinned, err := pinnedMemory(cg); err == nil {
+			row("pinned for DMA", formatSize(pinned)+" of that memory")
+		} else {
+			row("pinned for DMA", "not available")
+		}
+	}
+	// The guest writes its memory figures, its counters and any error, so
+	// only printable text of theirs reaches the terminal.
+	if meminfo, err := mconsole.Request(mconsolePath(name), "proc meminfo"); err == nil {
+		row("guest memory", printable(guestMemory(meminfo)))
+	}
 	text, err := mconsole.Request(mconsolePath(name), "proc vduse_guest")
 	if err != nil {
 		row("guest counters", printable(fmt.Sprintf("not available: %v", err)))

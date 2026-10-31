@@ -334,3 +334,20 @@ func TestLineLoggerClose(t *testing.T) {
 		t.Errorf("logged %q", out.String())
 	}
 }
+
+func TestMemory(t *testing.T) {
+	for n, want := range map[int64]string{512: "512B", 1023: "1023B", 1024: "1K", 3 << 10: "3K", 412 << 20: "412M",
+		1<<30 - 1<<10: "1.00G", 1280 << 20: "1.25G"} {
+		if got := formatSize(n); got != want {
+			t.Errorf("formatSize(%d) = %q, want %q", n, got, want)
+		}
+	}
+	st := parseKeyed("anon 2097152\nfile 10485760\nshmem 8388608\n")
+	if st["anon"] != 2<<20 || st["file"] != 10<<20 || st["shmem"] != 8<<20 {
+		t.Errorf("parseKeyed(memory.stat) = %v", st)
+	}
+	got := guestMemory("MemTotal:       786432 kB\nMemFree:        524288 kB\nMemAvailable:   655360 kB\n")
+	if want := "128M used of 768M, 512M free"; got != want {
+		t.Errorf("guestMemory = %q, want %q", got, want)
+	}
+}
