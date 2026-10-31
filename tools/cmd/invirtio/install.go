@@ -9,6 +9,8 @@ import (
 	"os/exec"
 	"os/user"
 	"path/filepath"
+
+	"invirtio/internal/command"
 )
 
 // The service runs one device's guest. KillMode=mixed sends the stop signal
@@ -154,7 +156,7 @@ func hostChecks() []action {
 		{
 			show: showCmd("modprobe", "-n", "-a", "vfio-pci", "vduse", "vdpa", "virtio_vdpa"),
 			run: func() error {
-				if err := runCmd("modprobe", "-n", "-a", "vfio-pci", "vduse", "vdpa", "virtio_vdpa"); err != nil {
+				if err := command.Run("modprobe", "-n", "-a", "vfio-pci", "vduse", "vdpa", "virtio_vdpa"); err != nil {
 					return fmt.Errorf("the host kernel lacks a module: %v", err)
 				}
 				return nil
@@ -163,7 +165,7 @@ func hostChecks() []action {
 		{
 			show: showCmd("modprobe", "-n", "virtio_wlan"),
 			run: func() error {
-				if err := runCmd("modprobe", "-n", "virtio_wlan"); err != nil {
+				if err := command.Run("modprobe", "-n", "virtio_wlan"); err != nil {
 					warn("the host kernel has no virtio_wlan, so WiFi devices cannot be exported")
 				}
 				return nil

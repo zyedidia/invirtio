@@ -10,6 +10,8 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+
+	"invirtio/internal/pci"
 )
 
 // Where install puts InvirtIO.
@@ -154,7 +156,7 @@ func loadConfig() (*Config, error) {
 		if _, ok := defaultMemory[d.Type]; !ok {
 			return nil, fmt.Errorf("%s: device %s has the unknown type %q", configPath, name, d.Type)
 		}
-		if !validAddress(d.Address) {
+		if !pci.ValidAddress(d.Address) {
 			return nil, fmt.Errorf("%s: device %s has the invalid address %q", configPath, name, d.Address)
 		}
 	}

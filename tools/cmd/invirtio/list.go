@@ -9,6 +9,9 @@ import (
 	"sort"
 	"strings"
 	"text/tabwriter"
+
+	"invirtio/internal/pci"
+	"invirtio/internal/sysfs"
 )
 
 func cmdList(args []string) error {
@@ -39,24 +42,24 @@ func cmdList(args []string) error {
 	found := false
 	for _, p := range paths {
 		addr := filepath.Base(p)
-		class, err := readSysfs(filepath.Join(p, "class"))
+		class, err := sysfs.Read(filepath.Join(p, "class"))
 		if err != nil {
 			continue
 		}
-		typ := classType(class)
+		typ := pci.ClassType(class)
 		if typ == "" {
 			continue
 		}
 		found = true
 
-		host := pciDriver(addr)
+		host := pci.Driver(addr)
 		if host == "" {
 			host = "none"
 		}
 		guest := "unknown"
 		if modinfoErr == nil {
-			alias, _ := readSysfs(filepath.Join(p, "modalias"))
-			guest = matchDriver(alias, modinfo)
+			alias, _ := sysfs.Read(filepath.Join(p, "modalias"))
+			guest = pci.MatchDriver(alias, modinfo)
 			if guest == "" {
 				guest = "not supported"
 			}
@@ -102,7 +105,7 @@ func lspciNames() map[string]string {
 // controller: MEDIATEK Corp. MT7922 ...", into the address and the name.
 func parseLspci(line string) (string, string, bool) {
 	addr, rest, ok := strings.Cut(line, " ")
-	if !ok || !validAddress(addr) {
+	if !ok || !pci.ValidAddress(addr) {
 		return "", "", false
 	}
 	if _, name, ok := strings.Cut(rest, ": "); ok {
@@ -113,7 +116,7 @@ func parseLspci(line string) (string, string, bool) {
 
 // pciIDs returns a device's vendor and device IDs, as vvvv:dddd.
 func pciIDs(dir string) string {
-	vendor, _ := readSysfs(filepath.Join(dir, "vendor"))
-	device, _ := readSysfs(filepath.Join(dir, "device"))
+	vendor, _ := sysfs.Read(filepath.Join(dir, "vendor"))
+	device, _ := sysfs.Read(filepath.Join(dir, "device"))
 	return strings.TrimPrefix(vendor, "0x") + ":" + strings.TrimPrefix(device, "0x")
 }

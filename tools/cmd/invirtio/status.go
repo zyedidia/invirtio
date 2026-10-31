@@ -8,6 +8,11 @@ import (
 	"path/filepath"
 	"strings"
 	"unicode/utf8"
+
+	"invirtio/internal/mconsole"
+	"invirtio/internal/pci"
+	"invirtio/internal/sysfs"
+	"invirtio/internal/vdpa"
 )
 
 func cmdStatus(args []string) error {
@@ -67,25 +72,25 @@ func showDevice(name string, dev *Device, verbose bool) {
 	fmt.Printf("%s (%s, %s)\n", name, dev.Type, dev.Address)
 	active := systemctlState("is-active", unit)
 	row("service", active+", "+systemctlState("is-enabled", unit))
-	host := pciDriver(dev.Address)
+	host := pci.Driver(dev.Address)
 	if host == "" {
 		host = "none"
 	}
 	row("host driver", host)
-	if drv, err := guestDriver(dev.Address, modinfoPath); err == nil {
+	if drv, err := pci.GuestDriver(dev.Address, modinfoPath); err == nil {
 		row("guest driver", drv)
 	} else {
 		row("guest driver", "none")
 	}
 
 	state := "not created"
-	if vduseExists(name) {
+	if vdpa.Exists(name) {
 		state = "created"
-		if vdpaAttached(name) && active != "active" && active != "activating" {
+		if vdpa.Attached(name) && active != "active" && active != "activating" {
 			// A net device stays on the bus for the next guest, which does
 			// not come when the service stopped before restarting.
 			state += ", on the vDPA bus with no guest, invirtio disable removes it"
-		} else if vdpaAttached(name) {
+		} else if vdpa.Attached(name) {
 			state += ", on the vDPA bus"
 		} else {
 			state += ", not on the vDPA bus"
@@ -93,12 +98,12 @@ func showDevice(name string, dev *Device, verbose bool) {
 	}
 	row("VDUSE device", state)
 
-	nets := hostInterfaces(name)
+	nets := vdpa.HostInterfaces(name)
 	if len(nets) == 0 {
 		row("host interface", "none")
 	}
 	for _, n := range nets {
-		oper, err := readSysfs(filepath.Join("/sys/class/net", n, "operstate"))
+		oper, err := sysfs.Read(filepath.Join("/sys/class/net", n, "operstate"))
 		if err != nil {
 			oper = "unknown"
 		}
@@ -110,7 +115,7 @@ func showDevice(name string, dev *Device, verbose bool) {
 	}
 	// The guest writes the counters and any error, so only printable text
 	// of theirs reaches the terminal.
-	text, err := mconsole(mconsolePath(name), "proc vduse_guest")
+	text, err := mconsole.Request(mconsolePath(name), "proc vduse_guest")
 	if err != nil {
 		row("guest counters", printable(fmt.Sprintf("not available: %v", err)))
 		return

@@ -11,6 +11,8 @@ import (
 
 	"golang.org/x/sys/unix"
 	"golang.org/x/term"
+
+	"invirtio/internal/pci"
 )
 
 func TestParseSize(t *testing.T) {
@@ -62,8 +64,8 @@ func TestMatchDriver(t *testing.T) {
 		"pci:v000010ECd00008125sv000010ECsd00000123bc02sc00i00": "",
 	}
 	for alias, want := range cases {
-		if got := matchDriver(alias, modinfo); got != want {
-			t.Errorf("matchDriver(%q) = %q, want %q", alias, got, want)
+		if got := pci.MatchDriver(alias, modinfo); got != want {
+			t.Errorf("pci.MatchDriver(%q) = %q, want %q", alias, got, want)
 		}
 	}
 }
@@ -282,8 +284,8 @@ func TestDisableDryRun(t *testing.T) {
 func TestClassType(t *testing.T) {
 	cases := map[string]string{"0x028000": "wlan", "0x020000": "net", "0x010802": "", "0x0280": "wlan"}
 	for class, want := range cases {
-		if got := classType(class); got != want {
-			t.Errorf("classType(%q) = %q, want %q", class, got, want)
+		if got := pci.ClassType(class); got != want {
+			t.Errorf("pci.ClassType(%q) = %q, want %q", class, got, want)
 		}
 	}
 }

@@ -27,7 +27,7 @@ described in `linux-host/README.md`.
 ```
 ./download.sh --shallow
 make -C launcher
-make -C manager
+make -C tools
 scripts/invirtio-build-guest.sh
 ```
 

@@ -8,6 +8,9 @@ import (
 	"strings"
 
 	"golang.org/x/term"
+
+	"invirtio/internal/command"
+	"invirtio/internal/sysfs"
 )
 
 // An action is one step of a stage. show is the shell command that does the
@@ -96,7 +99,7 @@ func showCmd(name string, args ...string) string {
 func cmdAction(name string, args ...string) action {
 	return action{
 		show: showCmd(name, args...),
-		run:  func() error { return runCmd(name, args...) },
+		run:  func() error { return command.Run(name, args...) },
 	}
 }
 
@@ -130,7 +133,7 @@ func sysfsAction(path, value string, needed func() bool) action {
 			if needed != nil && !needed() {
 				return nil
 			}
-			return writeSysfs(path, value+"\n")
+			return sysfs.Write(path, value+"\n")
 		},
 	}
 }

@@ -1,4 +1,5 @@
-package main
+// Package mconsole talks to a UML guest's management console.
+package mconsole
 
 import (
 	"bytes"
@@ -18,9 +19,9 @@ const (
 	mconsoleMaxReply = 1 << 20
 )
 
-// mconsole sends one command to a guest's management console, which the
+// Request sends one command to a guest's management console, which the
 // launcher relays from the socket at path, and returns the reply's text.
-func mconsole(path, cmd string) (string, error) {
+func Request(path, cmd string) (string, error) {
 	if len(cmd) >= mconsoleMaxData {
 		return "", fmt.Errorf("the command is longer than %d bytes", mconsoleMaxData-1)
 	}

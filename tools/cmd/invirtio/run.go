@@ -20,6 +20,10 @@ import (
 	"unicode/utf8"
 
 	"golang.org/x/sys/unix"
+
+	"invirtio/internal/command"
+	"invirtio/internal/sysfs"
+	"invirtio/internal/vdpa"
 )
 
 // How long the guest has to create its device before the supervisor gives up
@@ -93,7 +97,7 @@ func supervise(name string, dev *Device) error {
 	sigs := make(chan os.Signal, 2)
 	signal.Notify(sigs, syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
 
-	if err := runCmd("modprobe", append([]string{"-a"}, modules(dev.Type)...)...); err != nil {
+	if err := command.Run("modprobe", append([]string{"-a"}, modules(dev.Type)...)...); err != nil {
 		return err
 	}
 	if err := os.MkdirAll(runDir, 0700); err != nil {
@@ -240,7 +244,7 @@ wait:
 				// The host resets the device as it removes it, which the
 				// guest answers while it still runs.
 				att.stop()
-				if err := vdpaRemove(name, launcherGone.Load()); err != nil {
+				if err := vdpa.Remove(name, launcherGone.Load()); err != nil {
 					warn("%v", err)
 				}
 				logf("stopping the guest of %s", name)
@@ -258,8 +262,8 @@ wait:
 	}
 	// VDUSE takes a device onto the bus without its guest, so one that the
 	// attacher adds now waits for the message timeout, which is lowered.
-	if !vdpaAttached(name) && vduseExists(name) {
-		writeSysfs(filepath.Join("/sys/class/vduse", name, "msg_timeout"), "1")
+	if !vdpa.Attached(name) && vdpa.Exists(name) {
+		sysfs.Write(filepath.Join("/sys/class/vduse", name, "msg_timeout"), "1")
 	}
 	att.stop()
 	live := att.isLive()
@@ -274,9 +278,9 @@ wait:
 
 	// A net device stays on the bus only if a live guest had it there and
 	// it is still there.
-	if stopping || dev.Type == "wlan" || !live || !vdpaAttached(name) {
+	if stopping || dev.Type == "wlan" || !live || !vdpa.Attached(name) {
 		cleanup(name)
-	} else if vdpaAttached(name) {
+	} else if vdpa.Attached(name) {
 		logf("%s stays on the vDPA bus for the next guest", name)
 	}
 	if stopping {
@@ -327,10 +331,10 @@ func isMountPoint(dir string) bool {
 
 // cleanup removes a device whose guest is gone from the host.
 func cleanup(name string) {
-	if err := vdpaRemove(name, true); err != nil {
+	if err := vdpa.Remove(name, true); err != nil {
 		warn("%v", err)
 	}
-	if err := vduseDestroy(name); err != nil {
+	if err := vdpa.Destroy(name); err != nil {
 		warn("%v", err)
 	}
 }
@@ -360,8 +364,8 @@ func startAttacher(name string, launcherGone *atomic.Bool) *attacher {
 				a.mu.Unlock()
 				return
 			}
-			if vdpaAttached(name) {
-				err := bindVirtioVdpa(name)
+			if vdpa.Attached(name) {
+				err := vdpa.BindVirtio(name)
 				a.live = err == nil && !launcherGone.Load()
 				a.mu.Unlock()
 				if err != nil {
@@ -372,8 +376,8 @@ func startAttacher(name string, launcherGone *atomic.Bool) *attacher {
 					name, strings.Join(waitInterfaces(name), ", "))
 				return
 			}
-			if vduseExists(name) {
-				last = vdpaAdd(name)
+			if vdpa.Exists(name) {
+				last = vdpa.Add(name)
 			}
 			a.mu.Unlock()
 			time.Sleep(200 * time.Millisecond)
@@ -404,7 +408,7 @@ func (a *attacher) stop() {
 // waitInterfaces gives the host's driver a moment to make its interface.
 func waitInterfaces(name string) []string {
 	for i := 0; i < 50; i++ {
-		if nets := hostInterfaces(name); len(nets) > 0 {
+		if nets := vdpa.HostInterfaces(name); len(nets) > 0 {
 			return nets
 		}
 		time.Sleep(100 * time.Millisecond)
@@ -453,7 +457,7 @@ func setupCgroup(name string, dev *Device) (string, error) {
 		{filepath.Join(guest, "pids.max"), "4096", false},
 	}
 	for _, s := range steps {
-		err := writeSysfs(s.file, s.value)
+		err := sysfs.Write(s.file, s.value)
 		if s.optional && errors.Is(err, os.ErrNotExist) {
 			continue
 		}

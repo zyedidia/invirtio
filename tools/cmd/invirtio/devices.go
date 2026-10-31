@@ -11,6 +11,10 @@ import (
 	"time"
 
 	"golang.org/x/sys/unix"
+
+	"invirtio/internal/command"
+	"invirtio/internal/pci"
+	"invirtio/internal/vdpa"
 )
 
 func cmdEnable(args []string) error {
@@ -31,7 +35,7 @@ func cmdEnable(args []string) error {
 	if !*dry {
 		requireRoot()
 	}
-	addr, err := normalizeAddress(fs.Arg(0))
+	addr, err := pci.NormalizeAddress(fs.Arg(0))
 	if err != nil {
 		return err
 	}
@@ -39,15 +43,15 @@ func cmdEnable(args []string) error {
 		return errors.New("InvirtIO is not installed, run invirtio install")
 	}
 
-	typ, err := pciType(addr)
+	typ, err := pci.Type(addr)
 	if err != nil {
 		return err
 	}
-	drv, err := guestDriver(addr, modinfoPath)
+	drv, err := pci.GuestDriver(addr, modinfoPath)
 	if err != nil {
 		return err
 	}
-	if err := checkGroup(addr); err != nil {
+	if err := pci.CheckGroup(addr); err != nil {
 		return err
 	}
 	if *memory != "" {
@@ -62,9 +66,9 @@ func cmdEnable(args []string) error {
 	}
 	// Only one process can open a VFIO group, so two devices in one group
 	// cannot each have a guest.
-	group, _ := iommuGroup(addr)
+	group, _ := pci.IOMMUGroup(addr)
 	for n, d := range cfg.Devices {
-		if g, err := iommuGroup(d.Address); err == nil && g == group && d.Address != addr {
+		if g, err := pci.IOMMUGroup(d.Address); err == nil && g == group && d.Address != addr {
 			return fmt.Errorf("%s is in IOMMU group %s with %s, which is enabled as %s", addr, group, d.Address, n)
 		}
 	}
@@ -92,7 +96,7 @@ func cmdEnable(args []string) error {
 		record = append(record, a)
 	}
 
-	host := pciDriver(addr)
+	host := pci.Driver(addr)
 	if host == "" {
 		host = "no driver"
 	}
@@ -144,7 +148,7 @@ func cmdDisable(args []string) error {
 		return err
 	}
 	key := strings.ToLower(fs.Arg(0))
-	if addr, err := normalizeAddress(key); err == nil {
+	if addr, err := pci.NormalizeAddress(key); err == nil {
 		key = addr
 	}
 	name, dev, err := cfg.lookup(key)
@@ -160,7 +164,7 @@ func cmdDisable(args []string) error {
 		return err
 	}
 	if !*dry {
-		drv := pciDriver(dev.Address)
+		drv := pci.Driver(dev.Address)
 		if drv == "" {
 			drv = "no driver"
 		}
@@ -194,11 +198,11 @@ func disableStages(name string, dev *Device) []stage {
 	addr := dev.Address
 	// A device that is gone from the PCI bus has no driver to return to.
 	present := func() bool {
-		_, err := os.Stat(pciPath(addr, ""))
+		_, err := os.Stat(pci.Path(addr, ""))
 		return err == nil
 	}
-	onVFIO := func() bool { return pciDriver(addr) == "vfio-pci" }
-	unbound := func() bool { return present() && pciDriver(addr) == "" }
+	onVFIO := func() bool { return pci.Driver(addr) == "vfio-pci" }
+	unbound := func() bool { return present() && pci.Driver(addr) == "" }
 	return []stage{
 		{
 			title: name + ": stop the guest and keep it from starting at boot",
@@ -206,7 +210,7 @@ func disableStages(name string, dev *Device) []stage {
 			actions: []action{{
 				show: showCmd("systemctl", "disable", "--now", unit),
 				run: func() error {
-					err := runCmd("systemctl", "disable", "--now", unit)
+					err := command.Run("systemctl", "disable", "--now", unit)
 					if err == nil {
 						return nil
 					}
@@ -214,7 +218,7 @@ func disableStages(name string, dev *Device) []stage {
 					// file can be gone, and the service can only be
 					// stopped.
 					if _, serr := os.Stat(unitPath); errors.Is(serr, os.ErrNotExist) {
-						runCmd("systemctl", "stop", unit)
+						command.Run("systemctl", "stop", unit)
 						return nil
 					}
 					return err
@@ -225,16 +229,16 @@ func disableStages(name string, dev *Device) []stage {
 			title: name + ": remove what a failed guest left on the host",
 			notes: "A step is skipped when there is nothing for it to remove.",
 			actions: []action{
-				sysfsAction(vduse+"/msg_timeout", "1", func() bool { return vdpaAttached(name) }),
+				sysfsAction(vduse+"/msg_timeout", "1", func() bool { return vdpa.Attached(name) }),
 				{
 					show: showCmd("vdpa", "dev", "del", name),
 					run: func() error {
-						return vdpaRemove(name, true)
+						return vdpa.Remove(name, true)
 					},
 				},
 				{
 					show: "# the VDUSE_DESTROY_DEV ioctl for " + name + " on /dev/vduse/control, which no command makes",
-					run:  func() error { return vduseDestroy(name) },
+					run:  func() error { return vdpa.Destroy(name) },
 				},
 				{
 					show: showCmd("rm", "-f", logPath(name)),
@@ -276,8 +280,8 @@ func disableStages(name string, dev *Device) []stage {
 			title: name + ": return " + addr + " to its host driver",
 			notes: "The unbind is skipped unless vfio-pci has the device, and the probe\nunless no driver has it. All three are skipped for a device that is gone\nfrom the PCI bus.",
 			actions: []action{
-				sysfsAction(pciPath(addr, "driver_override"), "", present),
-				sysfsAction(pciPath(addr, "driver/unbind"), addr, onVFIO),
+				sysfsAction(pci.Path(addr, "driver_override"), "", present),
+				sysfsAction(pci.Path(addr, "driver/unbind"), addr, onVFIO),
 				sysfsAction("/sys/bus/pci/drivers_probe", addr, unbound),
 			},
 		},

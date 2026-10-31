@@ -1,15 +1,18 @@
-package main
+// Package vdpa manages VDUSE devices and puts them on and takes them off
+// the vDPA bus, where the host's virtio drivers take them.
+package vdpa
 
 import (
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"strings"
 	"time"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
+
+	"invirtio/internal/command"
+	"invirtio/internal/sysfs"
 )
 
 const (
@@ -18,65 +21,56 @@ const (
 	vduseDestroyDev = 0x41008103
 )
 
-func vduseExists(name string) bool {
+// Exists reports whether the VDUSE device exists.
+func Exists(name string) bool {
 	_, err := os.Stat(filepath.Join("/sys/class/vduse", name))
 	return err == nil
 }
 
-func vdpaAttached(name string) bool {
+// Attached reports whether the device is on the vDPA bus.
+func Attached(name string) bool {
 	_, err := os.Stat(filepath.Join("/sys/bus/vdpa/devices", name))
 	return err == nil
 }
 
-func runCmd(name string, args ...string) error {
-	out, err := exec.Command(name, args...).CombinedOutput()
-	if err != nil {
-		msg := strings.TrimSpace(string(out))
-		if msg == "" {
-			msg = err.Error()
-		}
-		return fmt.Errorf("%s %s: %s", name, strings.Join(args, " "), msg)
-	}
-	return nil
-}
-
-// vdpaAdd adds the device to the vDPA bus. VDUSE refuses the device until
+// Add adds the device to the vDPA bus. VDUSE refuses the device until
 // the guest has set up its queues.
-func vdpaAdd(name string) error {
-	return runCmd("vdpa", "dev", "add", "name", name, "mgmtdev", "vduse")
+func Add(name string) error {
+	return command.Run("vdpa", "dev", "add", "name", name, "mgmtdev", "vduse")
 }
 
-// bindVirtioVdpa makes sure that virtio_vdpa, which gives the host its
+// BindVirtio makes sure that virtio_vdpa, which gives the host its
 // virtio driver, has a device on the vDPA bus.
-func bindVirtioVdpa(name string) error {
+func BindVirtio(name string) error {
 	dev := filepath.Join("/sys/bus/vdpa/devices", name)
 	link, _ := os.Readlink(filepath.Join(dev, "driver"))
 	if filepath.Base(link) == "virtio_vdpa" {
 		return nil
 	}
 	if link != "" {
-		if err := writeSysfs(filepath.Join(dev, "driver/unbind"), name); err != nil {
+		if err := sysfs.Write(filepath.Join(dev, "driver/unbind"), name); err != nil {
 			return err
 		}
 	}
-	return writeSysfs("/sys/bus/vdpa/drivers/virtio_vdpa/bind", name)
+	return sysfs.Write("/sys/bus/vdpa/drivers/virtio_vdpa/bind", name)
 }
 
-// vdpaRemove removes the device from the vDPA bus. The host resets the
+// Remove removes the device from the vDPA bus. The host resets the
 // device first, and with no guest to answer, the reset waits for VDUSE's
 // message timeout, which is lowered when the guest is gone.
-func vdpaRemove(name string, guestGone bool) error {
-	if !vdpaAttached(name) {
+func Remove(name string, guestGone bool) error {
+	if !Attached(name) {
 		return nil
 	}
 	if guestGone {
-		writeSysfs(filepath.Join("/sys/class/vduse", name, "msg_timeout"), "1")
+		sysfs.Write(filepath.Join("/sys/class/vduse", name, "msg_timeout"), "1")
 	}
-	return runCmd("vdpa", "dev", "del", name)
+	return command.Run("vdpa", "dev", "del", name)
 }
 
-func vduseDestroy(name string) error {
-	if !vduseExists(name) {
+// Destroy destroys the VDUSE device, which must be off the vDPA bus.
+func Destroy(name string) error {
+	if !Exists(name) {
 		return nil
 	}
 	fd, err := unix.Open("/dev/vduse/control", unix.O_RDWR|unix.O_CLOEXEC, 0)
@@ -95,16 +89,16 @@ func vduseDestroy(name string) error {
 		if errno == 0 {
 			return nil
 		}
-		if errno != unix.EBUSY || n == 100 || vdpaAttached(name) {
+		if errno != unix.EBUSY || n == 100 || Attached(name) {
 			return fmt.Errorf("cannot destroy the VDUSE device %s: %v", name, errno)
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
 }
 
-// hostInterfaces returns the network interfaces that the host's virtio
+// HostInterfaces returns the network interfaces that the host's virtio
 // driver made for the device.
-func hostInterfaces(name string) []string {
+func HostInterfaces(name string) []string {
 	nets, _ := filepath.Glob(filepath.Join("/sys/bus/vdpa/devices", name, "virtio*/net/*"))
 	for i, n := range nets {
 		nets[i] = filepath.Base(n)

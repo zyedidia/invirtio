@@ -13,7 +13,7 @@ guest's kernel binds the driver that matches the device.
 
 ```
 make -C launcher
-make -C manager
+make -C tools
 scripts/invirtio-build-guest.sh
 ```
 
