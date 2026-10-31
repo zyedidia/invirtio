@@ -146,7 +146,7 @@ func TestGuestArgs(t *testing.T) {
 	want := "-u invirtio -b -d 0000:06:00.0 -i /usr/lib/invirtio/initramfs.cpio " +
 		"-s /run/invirtio/wlan-06-00-0.mconsole -t 30 " +
 		"-e wlan,wlan-06-00-0,log=/run/invirtio/wlan-06-00-0/inflight " +
-		"-g /sys/fs/cgroup/x/guest /usr/lib/invirtio/linux mem=768M " +
+		"-g /sys/fs/cgroup/x/guest /usr/lib/invirtio/linux mem=256M " +
 		"vduse_guest.device=wlan,wlan-06-00-0,poll=50 loglevel=4"
 	if got != want {
 		t.Errorf("guestArgs =\n%s\nwant\n%s", got, want)

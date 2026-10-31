@@ -64,7 +64,7 @@ type Config struct {
 }
 
 var defaultMemory = map[string]string{
-	"wlan": "768M",
+	"wlan": "256M",
 	"net":  "256M",
 }
 
