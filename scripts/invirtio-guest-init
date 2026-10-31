@@ -1,0 +1,15 @@
+#!/bin/sh
+# The init script of the driver guest that invirtio runs, for mkinitramfs.sh
+# -i. The backends need no user space, so init mounts the kernel's
+# filesystems and keeps a shell on the console, which invirtio console
+# attaches to. A shell that exits is started again, since init must not.
+
+export PATH=/sbin:/usr/sbin:/bin:/usr/bin
+mount -t devtmpfs devtmpfs /dev
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+
+while :; do
+	setsid cttyhack sh
+	sleep 1
+done
