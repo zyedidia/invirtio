@@ -10,8 +10,10 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"runtime/debug"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unsafe"
@@ -32,6 +34,10 @@ const (
 	gpuCapsetSize = 592
 	// Virglrenderer's context type for amdgpu.
 	gpuContextAmdgpu = 2
+	// The size of Mesa's shared memory buffer, blob 0, and the offset of
+	// its responses, which the guest writes into the buffer's header.
+	gpuShmemSize      = 0x4000
+	gpuShmemRspOffset = 88
 )
 
 // The virtio_gpu ioctls, DRM_IOWR(DRM_COMMAND_BASE + nr, size).
@@ -40,10 +46,26 @@ func drmIOWR(nr, size uintptr) uintptr {
 }
 
 var (
-	virtgpuGetparam       = drmIOWR(0x03, 16)
-	virtgpuResourceCreate = drmIOWR(0x04, 56)
-	virtgpuGetCaps        = drmIOWR(0x09, 24)
-	virtgpuContextInit    = drmIOWR(0x0b, 16)
+	virtgpuMap                = drmIOWR(0x01, 16)
+	virtgpuGetparam           = drmIOWR(0x03, 16)
+	virtgpuResourceCreate     = drmIOWR(0x04, 56)
+	virtgpuGetCaps            = drmIOWR(0x09, 24)
+	virtgpuResourceCreateBlob = drmIOWR(0x0a, 48)
+	virtgpuContextInit        = drmIOWR(0x0b, 16)
+	// DRM_IOCTL_PRIME_HANDLE_TO_FD, DRM_IOWR(0x2d, struct drm_prime_handle).
+	drmPrimeHandleToFD uintptr = 3<<30 | 12<<16 | 'd'<<8 | 0x2d
+)
+
+// The blob arguments of DRM_IOCTL_VIRTGPU_RESOURCE_CREATE_BLOB.
+const (
+	virtgpuBlobMemHost3D    = 2
+	virtgpuBlobFlagMappable = 1
+)
+
+// IORING_REGISTER_BUFFERS, and the size of struct io_uring_params.
+const (
+	ioringRegisterBuffers = 0
+	ioringParamsSize      = 120
 )
 
 // The parameters of DRM_IOCTL_VIRTGPU_GETPARAM.
@@ -75,6 +97,7 @@ var gpuTests = []gpuTest{
 	{"probe", "virtio_gpu probes a device with virgl, blobs, context init and the DRM capset, and no scanouts", gpuTestProbe},
 	{"contexts", "host processes create and destroy DRM contexts, and the device serves new ones after a reset", gpuTestContexts},
 	{"virgl", "the device refuses virgl resources and contexts, and keeps serving", gpuTestVirgl},
+	{"map", "the shared memory buffer maps through the DRM fd and a dma-buf, and the guest's exit revokes both", gpuTestMap},
 }
 
 type gpuSuite struct {
@@ -460,7 +483,7 @@ func gpuTestProbe(s *gpuSuite) {
 	}
 	log := strings.Join(harness.KernelLogSince(mark), "\n")
 	for _, line := range []string{
-		"features: +virgl -edid +resource_blob -host_visible",
+		"features: +virgl -edid +resource_blob +host_visible",
 		"features: +context_init -blob_alignment",
 		"KMS disabled",
 		"number of cap sets: 1",
@@ -480,7 +503,7 @@ func gpuTestProbe(s *gpuSuite) {
 	}{
 		{"3D_FEATURES", virtgpuParam3D, 1},
 		{"RESOURCE_BLOB", virtgpuParamResourceBlob, 1},
-		{"HOST_VISIBLE", virtgpuParamHostVisible, 0},
+		{"HOST_VISIBLE", virtgpuParamHostVisible, 1},
 		{"CONTEXT_INIT", virtgpuParamContextInit, 1},
 		{"SUPPORTED_CAPSET_IDs", virtgpuParamCapsetIDs, 1 << gpuCapsetDRM},
 	} {
@@ -632,4 +655,165 @@ func gpuTestVirgl(s *gpuSuite) {
 	s.Check(err == nil, "a process creates a DRM context afterwards%s", errSuffix(err))
 	ok = harness.Wait(func() bool { return g.Counters()["contexts"] == 1 }, 10*time.Second, 200*time.Millisecond)
 	s.Check(ok, "the guest has the new context")
+}
+
+// createShmem creates the context's shared memory buffer, blob 0, and
+// returns its GEM handle.
+func createShmem(fd int) (uint32, error) {
+	arg := struct {
+		blobMem, blobFlags, boHandle, resHandle uint32
+		size                                    uint64
+		pad, cmdSize                            uint32
+		cmd, blobID                             uint64
+	}{blobMem: virtgpuBlobMemHost3D, blobFlags: virtgpuBlobFlagMappable, size: gpuShmemSize}
+	err := ioctl(fd, virtgpuResourceCreateBlob, unsafe.Pointer(&arg))
+	return arg.boHandle, err
+}
+
+// mapOffset returns the fake offset at which a GEM object is mapped.
+func mapOffset(fd int, handle uint32) (int64, error) {
+	arg := struct {
+		offset      uint64
+		handle, pad uint32
+	}{handle: handle}
+	err := ioctl(fd, virtgpuMap, unsafe.Pointer(&arg))
+	return int64(arg.offset), err
+}
+
+func primeHandleToFD(fd int, handle uint32) (int, error) {
+	arg := struct {
+		handle, flags uint32
+		fd            int32
+	}{handle: handle, flags: unix.O_CLOEXEC | unix.O_RDWR}
+	err := ioctl(fd, drmPrimeHandleToFD, unsafe.Pointer(&arg))
+	return int(arg.fd), err
+}
+
+// readFaults reads the first word of a mapping and reports whether the read
+// faulted.
+func readFaults(b []byte) (faulted bool) {
+	done := make(chan bool)
+	go func() {
+		debug.SetPanicOnFault(true)
+		defer func() { done <- recover() != nil }()
+		// An atomic load always reads the page, which a plain load whose
+		// value is unused need not.
+		atomic.LoadUint32((*uint32)(unsafe.Pointer(&b[0])))
+	}()
+	return <-done
+}
+
+// registerBuffer registers a mapping as an io_uring buffer and returns the
+// error, or nil if io_uring is not available.
+func registerBuffer(b []byte) (error, bool) {
+	var params [ioringParamsSize]byte
+	ring, _, errno := unix.Syscall(unix.SYS_IO_URING_SETUP, 1, uintptr(unsafe.Pointer(&params[0])), 0)
+	if errno != 0 {
+		return nil, false
+	}
+	defer unix.Close(int(ring))
+	iov := unix.Iovec{Base: &b[0]}
+	iov.SetLen(len(b))
+	_, _, errno = unix.Syscall6(unix.SYS_IO_URING_REGISTER, ring, ioringRegisterBuffers,
+		uintptr(unsafe.Pointer(&iov)), 1, 0, 0)
+	if errno != 0 {
+		return errno, true
+	}
+	return nil, true
+}
+
+func gpuTestMap(s *gpuSuite) {
+	g := s.start()
+	if g == nil {
+		return
+	}
+	node := s.attach()
+	if node == "" {
+		return
+	}
+	// The files and mappings are released before the guest's device is
+	// removed, and the deferred release skips those already gone.
+	var drm, dmabuf []byte
+	fd, buf := -1, -1
+	defer func() {
+		for _, m := range [][]byte{drm, dmabuf} {
+			if m != nil {
+				unix.Munmap(m)
+			}
+		}
+		for _, f := range []int{buf, fd} {
+			if f >= 0 {
+				unix.Close(f)
+			}
+		}
+	}()
+	fd, err := openRender(node)
+	if !s.Check(err == nil, "the render node opens%s", errSuffix(err)) {
+		return
+	}
+	err = contextInit(fd, gpuCapsetDRM)
+	if !s.Check(err == nil, "a process creates a DRM context%s", errSuffix(err)) {
+		return
+	}
+	handle, err := createShmem(fd)
+	if !s.Check(err == nil, "the process creates its shared memory buffer%s", errSuffix(err)) {
+		return
+	}
+	offset, err := mapOffset(fd, handle)
+	if !s.Check(err == nil, "the buffer gets a mapping offset%s", errSuffix(err)) {
+		return
+	}
+
+	private, err := unix.Mmap(fd, offset, gpuShmemSize, unix.PROT_READ|unix.PROT_WRITE, unix.MAP_PRIVATE)
+	if err == nil {
+		unix.Munmap(private)
+	}
+	s.Check(err == unix.EINVAL, "a private mapping of the buffer is refused%s", errSuffix(err))
+
+	drm, err = unix.Mmap(fd, offset, gpuShmemSize, unix.PROT_READ|unix.PROT_WRITE, unix.MAP_SHARED)
+	if !s.Check(err == nil, "the buffer maps through the DRM fd%s", errSuffix(err)) {
+		return
+	}
+	le := binary.LittleEndian
+	s.Check(le.Uint32(drm[4:]) == gpuShmemRspOffset, "the guest's header gives the responses' offset %d, not %d",
+		gpuShmemRspOffset, le.Uint32(drm[4:]))
+	drm[gpuShmemSize-1] = 0x5a
+
+	buf, err = primeHandleToFD(fd, handle)
+	if !s.Check(err == nil, "the buffer is exported as a dma-buf%s", errSuffix(err)) {
+		buf = -1
+		return
+	}
+	dmabuf, err = unix.Mmap(buf, 0, gpuShmemSize, unix.PROT_READ|unix.PROT_WRITE, unix.MAP_SHARED)
+	if !s.Check(err == nil, "the dma-buf maps%s", errSuffix(err)) {
+		return
+	}
+	s.Check(le.Uint32(dmabuf[4:]) == gpuShmemRspOffset && dmabuf[gpuShmemSize-1] == 0x5a,
+		"the dma-buf mapping shows the guest's header and the host's write")
+
+	if err, ok := registerBuffer(drm); ok {
+		s.Check(err == unix.EFAULT, "registering the mapping as an io_uring buffer fails with EFAULT%s", errSuffix(err))
+	} else {
+		fmt.Println("io_uring is not available, so its check is skipped")
+	}
+	ok := harness.Wait(func() bool { return g.Counters()["resources"] == 1 }, 10*time.Second, 200*time.Millisecond)
+	s.Check(ok, "the guest has the buffer's resource")
+	s.counters(g)
+
+	// The guest's exit closes its VDUSE fd, which revokes the region.
+	g.Kill()
+	ok = harness.Wait(func() bool { return readFaults(drm) && readFaults(dmabuf) }, 30*time.Second, 200*time.Millisecond)
+	s.Check(ok, "after the guest exits, both mappings give SIGBUS")
+
+	unix.Munmap(drm)
+	unix.Munmap(dmabuf)
+	drm, dmabuf = nil, nil
+	unix.Close(buf)
+	unix.Close(fd)
+	buf, fd = -1, -1
+	if !s.released() {
+		return
+	}
+	err = harness.Detach(gpuName, true)
+	s.Check(err == nil, "vdpa dev del removes the device of the dead guest%s", errSuffix(err))
 }
