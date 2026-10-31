@@ -1492,9 +1492,17 @@ struct broker_request {
 	uint64_t features;
 	uint64_t log_size;
 	uint32_t config_size;
-	uint32_t reserved;
+	uint32_t api_version;
 	char name[VDUSE_NAME_MAX];
 };
+
+/*
+ * VDUSE API version 2 adds shared memory regions, which a device sets up on
+ * its own fd. From version 1 on, a device declares its numbers of queue
+ * groups and address spaces, which older headers keep as the first two
+ * reserved words of the configuration.
+ */
+#define BROKER_API_VERSION_2 2
 
 /* VDUSE takes at most a page of configuration space. */
 #define BROKER_MAX_CONFIG 4096
@@ -1532,8 +1540,8 @@ static struct export *find_export(const char *name)
 }
 
 /*
- * The launcher fills in the device's configuration itself, so that fields of
- * newer VDUSE versions stay zero.
+ * The launcher fills in the device's configuration itself, so that the guest
+ * sets no field beyond those of its request.
  */
 static int vduse_create(const struct export *e,
 			const struct broker_request *req, const uint8_t *config)
@@ -1549,10 +1557,34 @@ static int vduse_create(const struct export *e,
 	cfg->features = req->features;
 	cfg->vq_num = req->vq_num;
 	cfg->vq_align = req->vq_align;
+	if (req->api_version) {
+#ifdef VDUSE_API_VERSION_1
+		cfg->ngroups = 1;
+		cfg->nas = 1;
+#else
+		cfg->reserved[0] = 1;
+		cfg->reserved[1] = 1;
+#endif
+	}
 	cfg->config_size = req->config_size;
 	memcpy(cfg->config, config, req->config_size);
-	if (ioctl(vduse_control, VDUSE_CREATE_DEV, cfg) < 0)
+
+	/* The control device creates devices with the version last set. */
+	if (req->api_version) {
+		uint64_t version = req->api_version;
+
+		if (ioctl(vduse_control, VDUSE_SET_API_VERSION, &version) < 0)
+			err = -errno;
+	}
+	if (!err && ioctl(vduse_control, VDUSE_CREATE_DEV, cfg) < 0)
 		err = -errno;
+	if (req->api_version) {
+		uint64_t version = 0;
+
+		if (ioctl(vduse_control, VDUSE_SET_API_VERSION, &version) < 0)
+			die("cannot set the VDUSE API version: %s",
+			    strerror(errno));
+	}
 	free(cfg);
 	return err;
 }
@@ -1605,7 +1637,11 @@ static int handle_request(const struct broker_request *req,
 	case BROKER_CREATE:
 		if (req->device_id != e->device_id)
 			return -EPERM;
-		if (req->reserved || len != sizeof(*req) + req->config_size ||
+		/* Only a GPU device has shared memory regions. */
+		if ((req->api_version &&
+		     (req->api_version != BROKER_API_VERSION_2 ||
+		      e->device_id != VIRTIO_ID_GPU)) ||
+		    len != sizeof(*req) + req->config_size ||
 		    !req->vq_num || req->vq_num > BROKER_MAX_QUEUES)
 			return -EINVAL;
 		/*
