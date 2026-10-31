@@ -72,6 +72,8 @@ type NetBenchTarget struct {
 	Runs []NetBenchRun `json:"runs"`
 	// The guest's /proc/vduse_guest after the target's jobs.
 	Counters map[string]int64 `json:"counters,omitempty"`
+	// The guest's memory over the target's jobs.
+	Memory *harness.GuestMemory `json:"memory,omitempty"`
 }
 
 type NetBenchResults struct {
@@ -80,7 +82,10 @@ type NetBenchResults struct {
 }
 
 type netBenchSuite struct {
-	out     string
+	out string
+	mem string
+	// memory records the guest's memory while its jobs run.
+	memory  *harness.GuestMemory
 	build   string
 	reps    int
 	seconds int
@@ -113,8 +118,10 @@ is one of:
 The default runs both. Both ports have an MTU of 9000. Each job runs -reps
 times, and each throughput job for -time seconds. A job's CPU use is the
 number of the host's CPUs that were busy, and with the guest, the share of
-them that its UML process took and how busy the guest's own CPU was. Build
-the guest with scripts/invirtio-build-guest.sh -t net-bench. The output
+them that its UML process took and how busy the guest's own CPU was. The
+guest runs with -mem in a cgroup of its own, as invirtio's guests do, and
+the results record the cgroup's peak memory and the most memory that the
+guest itself used between jobs. Build the guest with scripts/invirtio-build-guest.sh -t net-bench. The output
 directory gets results.json and the summary, which bench-net-summary prints
 again. Run as root on the linux-host kernel, with iperf3, netperf and
 ethtool.
@@ -124,6 +131,7 @@ Jobs:`+netBenchJobList())
 	out := fs.String("out", filepath.Join(root, "build/bench-net"), "the output directory")
 	reps := fs.Int("reps", 3, "the repetitions of each job")
 	seconds := fs.Int("time", 10, "the seconds that each throughput job runs")
+	mem := fs.String("mem", "1G", "the guest's memory, as UML's mem= takes it")
 	jobs := fs.String("jobs", "", "run only the jobs whose names contain this string")
 	fs.Parse(args)
 	targets := fs.Args()
@@ -138,7 +146,7 @@ Jobs:`+netBenchJobList())
 	}
 	requireRoot()
 
-	s := &netBenchSuite{build: *build, reps: *reps, seconds: *seconds}
+	s := &netBenchSuite{build: *build, reps: *reps, seconds: *seconds, mem: *mem}
 	for _, j := range netBenchJobs {
 		if strings.Contains(j.name, *jobs) {
 			s.jobs = append(s.jobs, j)
@@ -293,6 +301,13 @@ func (s *netBenchSuite) runGuest(t *NetBenchTarget) error {
 		return err
 	}
 	defer os.RemoveAll(logDir)
+	// The guest runs in a cgroup of its own, as invirtio's guests do, which
+	// records its peak memory.
+	cg, err := harness.MakeCgroup(netBenchName)
+	if err != nil {
+		return err
+	}
+	defer harness.RemoveCgroup(cg)
 	g, err := harness.LaunchGuest(filepath.Join(s.out, "guest.log"), harness.Launch{
 		Build:   s.build,
 		Type:    "net",
@@ -300,7 +315,8 @@ func (s *netBenchSuite) runGuest(t *NetBenchTarget) error {
 		Options: fmt.Sprintf("netdev=eth0,mtu=%d", netMTU),
 		LogDir:  logDir,
 		Devices: []string{netGuestPort},
-		Args:    []string{"mem=512M"},
+		Args:    []string{"mem=" + s.mem},
+		Cgroup:  cg,
 	})
 	if err != nil {
 		return err
@@ -310,7 +326,7 @@ func (s *netBenchSuite) runGuest(t *NetBenchTarget) error {
 		g.Stop(30 * time.Second)
 		g.Kill()
 		harness.Cleanup(netBenchName)
-		s.guest, s.uml = nil, 0
+		s.guest, s.uml, s.memory = nil, 0, nil
 	}()
 	if !g.WaitFor(netBenchName+": created", 2*time.Minute) {
 		return errors.New("the guest did not create its device, see guest.log")
@@ -349,10 +365,17 @@ func (s *netBenchSuite) runGuest(t *NetBenchTarget) error {
 	if !strings.Contains(g.Output("echo shell-ready", 30*time.Second), "shell-ready") {
 		return errors.New("the guest's shell does not answer, see guest.log")
 	}
+	s.memory = &harness.GuestMemory{Mem: s.mem}
+	s.memory.SampleGuest(g.Output("cat /proc/meminfo", 10*time.Second))
 	if err := s.runJobs(t, ""); err != nil {
 		return err
 	}
 	t.Counters = g.Counters()
+	if err := s.memory.ReadCgroup(cg); err != nil {
+		return err
+	}
+	t.Memory = s.memory
+	fmt.Println("  memory: " + t.Memory.Summary())
 	return nil
 }
 
@@ -424,6 +447,7 @@ func (s *netBenchSuite) runJobs(t *NetBenchTarget, ns string) error {
 					run.GuestBusy = float64(gbusy1-gbusy0) / float64(gtotal1-gtotal0)
 				}
 				run.HasGuest = true
+				s.memory.SampleGuest(s.guest.Output("cat /proc/meminfo", 10*time.Second))
 			}
 			if err != nil {
 				return fmt.Errorf("%s: %v", j.name, err)
@@ -613,5 +637,10 @@ func netBenchSummary(r *NetBenchResults) string {
 	b.WriteString("Each value is the median over the repetitions. host_cpus is how many of\n" +
 		"the host's CPUs were busy, uml_cpus the guest's UML process's share of\n" +
 		"them, and guest_busy how busy the guest's own CPU was.\n")
+	for _, t := range r.Targets {
+		if t.Memory != nil {
+			fmt.Fprintf(&b, "\n%s memory, %s\n", t.Name, t.Memory.Summary())
+		}
+	}
 	return b.String()
 }

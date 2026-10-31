@@ -61,6 +61,8 @@ type WlanBenchTarget struct {
 	// The round trips to the server, idle and during a download.
 	PingIdle   harness.Ping `json:"ping_idle"`
 	PingLoaded harness.Ping `json:"ping_loaded"`
+	// The guest's memory over the target's runs.
+	Memory *harness.GuestMemory `json:"memory,omitempty"`
 }
 
 type WlanBenchResults struct {
@@ -77,7 +79,11 @@ type wlanBenchSuite struct {
 	noServer bool
 	reps     int
 	seconds  int
+	mem      string
 	results  WlanBenchResults
+	// The guest of the guest target, whose memory is sampled between runs.
+	guest  *harness.Guest
+	memory *harness.GuestMemory
 	// ctx ends on a signal, which stops a running iperf3, and the target
 	// that runs then fails and cleans up.
 	ctx context.Context
@@ -105,7 +111,10 @@ given, or a host behind the access point that runs one. Each target runs
 iperf3 TCP to the server and from it, -reps times for -time seconds, and
 pings the server idle and during one more download. A run's CPU use is how
 many of the host's CPUs were busy, and with the guest, how many its UML
-process took. The card must not be in use, so stop its invirtio service
+process took. The guest runs with -mem in a cgroup of its own, as
+invirtio's guests do, and the results record the cgroup's peak memory and
+the most memory that the guest itself used between runs. The card must not
+be in use, so stop its invirtio service
 first, and it is returned to its driver afterwards. Build the guest with
 scripts/invirtio-build-guest.sh. The output directory gets results.json
 and the summary, which bench-wlan-summary prints again, and the logs. Run
@@ -119,6 +128,7 @@ busybox.`)
 	noServer := fs.Bool("no-server", false, "use an iperf3 server that already runs")
 	reps := fs.Int("reps", 3, "the repetitions of each direction")
 	seconds := fs.Int("time", 10, "the seconds that each iperf3 run takes")
+	mem := fs.String("mem", "768M", "the guest's memory, as UML's mem= takes it")
 	fs.Parse(args)
 	targets := fs.Args()
 	if len(targets) == 0 {
@@ -136,7 +146,7 @@ busybox.`)
 	}
 	requireRoot()
 
-	s := &wlanBenchSuite{build: *build, conf: *conf, server: *server, noServer: *noServer,
+	s := &wlanBenchSuite{build: *build, conf: *conf, server: *server, noServer: *noServer, mem: *mem,
 		reps: *reps, seconds: *seconds}
 	var err error
 	if s.card, err = pci.NormalizeAddress(*card); err != nil {
@@ -254,13 +264,21 @@ func (s *wlanBenchSuite) runGuest(t *WlanBenchTarget) error {
 		return err
 	}
 	defer os.RemoveAll(logDir)
+	// The guest runs in a cgroup of its own, as invirtio's guests do, which
+	// records its peak memory.
+	cg, err := harness.MakeCgroup(wlanBenchName)
+	if err != nil {
+		return err
+	}
+	defer harness.RemoveCgroup(cg)
 	g, err := harness.LaunchGuest(filepath.Join(s.out, "guest.log"), harness.Launch{
 		Build:   s.build,
 		Type:    "wlan",
 		Name:    wlanBenchName,
 		LogDir:  logDir,
 		Devices: []string{s.card},
-		Args:    []string{"mem=768M"},
+		Args:    []string{"mem=" + s.mem},
+		Cgroup:  cg,
 	})
 	if err != nil {
 		return err
@@ -270,6 +288,7 @@ func (s *wlanBenchSuite) runGuest(t *WlanBenchTarget) error {
 		g.Stop(30 * time.Second)
 		g.Kill()
 		harness.Cleanup(wlanBenchName)
+		s.guest, s.memory = nil, nil
 	}()
 	if !g.WaitFor(wlanBenchName+": created", 2*time.Minute) {
 		return errors.New("the guest did not create its device, see guest.log")
@@ -289,7 +308,18 @@ func (s *wlanBenchSuite) runGuest(t *WlanBenchTarget) error {
 	if uml == 0 {
 		return errors.New("cannot find the guest's UML process")
 	}
-	return s.measure(t, phy, net, uml)
+	s.guest, s.memory = g, &harness.GuestMemory{Mem: s.mem}
+	s.memory.SampleGuest(g.Output("cat /proc/meminfo", 10*time.Second))
+	if err := s.measure(t, phy, net, uml); err != nil {
+		return err
+	}
+	s.memory.SampleGuest(g.Output("cat /proc/meminfo", 10*time.Second))
+	if err := s.memory.ReadCgroup(cg); err != nil {
+		return err
+	}
+	t.Memory = s.memory
+	fmt.Println("  memory: " + t.Memory.Summary())
+	return nil
 }
 
 // measure joins the network in the namespace and runs the iperf3 runs and
@@ -432,6 +462,9 @@ func (s *wlanBenchSuite) measure(t *WlanBenchTarget, phy, net string, uml int) e
 			run.Mbps, run.Retransmits = res.ReceivedBPS/1e6, res.Retransmits
 			fmt.Printf("  %s %d: %.1f Mb/s, host_cpus %.2f, uml_cpus %.2f\n", run.Dir, rep, run.Mbps, run.HostCPUs, run.UMLCPUs)
 			t.Runs = append(t.Runs, run)
+			if s.guest != nil {
+				s.memory.SampleGuest(s.guest.Output("cat /proc/meminfo", 10*time.Second))
+			}
 		}
 	}
 	// The round trips under load are measured during one more download.
@@ -503,6 +536,11 @@ func wlanBenchSummary(r *WlanBenchResults) string {
 				p.name, p.p.Avg, p.p.Max, p.p.Mdev, p.p.Loss)
 		}
 		b.WriteString("\n")
+	}
+	for _, t := range r.Targets {
+		if t.Memory != nil {
+			fmt.Fprintf(&b, "%s memory, %s\n\n", t.Name, t.Memory.Summary())
+		}
 	}
 	b.WriteString("Mb/s is the median over the repetitions. host_cpus is how many of the\n" +
 		"host's CPUs were busy, and uml_cpus how many the guest's UML process took.\n")

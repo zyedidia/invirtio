@@ -27,6 +27,8 @@ type Launch struct {
 	Devices []string
 	// Args are added to the guest's command line.
 	Args []string
+	// Cgroup is the cgroup that the guest runs in, or "".
+	Cgroup string
 }
 
 // MakeLogDir makes a directory on a tmpfs for in-flight logs.
@@ -41,6 +43,9 @@ func LaunchGuest(path string, l Launch) (*Guest, error) {
 		filepath.Join(RepoRoot(), "build/invirtio-launch"), "-u", "nobody", "-t", "20",
 		"-l", "1024", "-i", filepath.Join(l.Build, "initramfs/initramfs.cpio"),
 		"-e", fmt.Sprintf("%s,%s,log=%s", l.Type, l.Name, filepath.Join(l.LogDir, "inflight")),
+	}
+	if l.Cgroup != "" {
+		argv = append(argv, "-g", l.Cgroup)
 	}
 	if len(l.Devices) > 0 {
 		argv = append(argv, "-b")
