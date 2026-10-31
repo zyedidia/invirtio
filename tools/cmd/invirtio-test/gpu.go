@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"regexp"
@@ -98,6 +99,7 @@ var gpuTests = []gpuTest{
 	{"contexts", "host processes create and destroy DRM contexts, and the device serves new ones after a reset", gpuTestContexts},
 	{"virgl", "the device refuses virgl resources and contexts, and keeps serving", gpuTestVirgl},
 	{"map", "the shared memory buffer maps through the DRM fd and a dma-buf, and the guest's exit revokes both", gpuTestMap},
+	{"mesa", "RADV from scripts/mesa-build.sh finds the render node", gpuTestMesa},
 }
 
 type gpuSuite struct {
@@ -107,6 +109,8 @@ type gpuSuite struct {
 	// device is the iGPU's PCI address, with its ROM, or "" for a guest
 	// without a GPU.
 	device string
+	// mesa is the prefix of the Mesa that scripts/mesa-build.sh built.
+	mesa string
 	// The test that runs, its directory, the directory of its in-flight
 	// log, and the guests it started, which a second signal kills. Ctx ends
 	// on a signal.
@@ -145,6 +149,7 @@ Tests:`+gpuTestList())
 	out := fs.String("out", filepath.Join(root, "build/test-gpu"), "the output directory")
 	device := fs.String("device", "", "the PCI address of the iGPU to pass through, such as 0000:01:00.0")
 	rom := fs.String("rom", "", "the VBIOS image of the iGPU")
+	mesa := fs.String("mesa", filepath.Join(root, "build/mesa"), "the prefix of the Mesa that scripts/mesa-build.sh built")
 	runRE := fs.String("run", "", "run only the tests whose names match this regular expression")
 	fs.Parse(args)
 	if fs.NArg() != 0 || (*rom != "") != (*device != "") {
@@ -157,7 +162,7 @@ Tests:`+gpuTestList())
 	}
 	requireRoot()
 
-	s := &gpuSuite{build: *build}
+	s := &gpuSuite{build: *build, mesa: *mesa}
 	if *device != "" {
 		r, err := filepath.Abs(*rom)
 		if err != nil {
@@ -816,4 +821,44 @@ func gpuTestMap(s *gpuSuite) {
 	}
 	err = harness.Detach(gpuName, true)
 	s.Check(err == nil, "vdpa dev del removes the device of the dead guest%s", errSuffix(err))
+}
+
+// mesaEnv returns an environment that uses the Mesa prefix, as
+// scripts/mesa-env.sh sets up.
+func (s *gpuSuite) mesaEnv() []string {
+	return append(os.Environ(),
+		"LD_LIBRARY_PATH="+filepath.Join(s.mesa, "lib"),
+		"VK_DRIVER_FILES="+filepath.Join(s.mesa, "share/vulkan/icd.d/radeon_icd.x86_64.json"),
+		"__EGL_VENDOR_LIBRARY_FILENAMES="+filepath.Join(s.mesa, "share/glvnd/egl_vendor.d/50_mesa.json"),
+		"GBM_BACKENDS_PATH="+filepath.Join(s.mesa, "lib/gbm"))
+}
+
+// gpuTestMesa checks that libdrm reports the render node, whose parent is a
+// vDPA device, so that RADV considers it. Without a GPU the capset is
+// zeros, and RADV stops there.
+func gpuTestMesa(s *gpuSuite) {
+	if !harness.Exists(filepath.Join(s.mesa, "lib/libvulkan_radeon.so")) {
+		s.Check(false, "the Mesa prefix %s is built", s.mesa)
+		return
+	}
+	g := s.start()
+	if g == nil {
+		return
+	}
+	node := s.attach()
+	if node == "" {
+		return
+	}
+	cmd := exec.CommandContext(s.ctx, "vulkaninfo", "--summary")
+	cmd.Env = append(s.mesaEnv(), "RADV_DEBUG=startup")
+	// Vulkaninfo fails without a GPU behind the capset, so only its
+	// output counts.
+	out, err := cmd.CombinedOutput()
+	os.WriteFile(filepath.Join(s.dir, "vulkaninfo.log"), out, 0644)
+	if len(out) == 0 && !s.Check(err == nil, "vulkaninfo runs%s", errSuffix(err)) {
+		return
+	}
+	s.Check(strings.Contains(string(out), "radv: info: Found device '"+node+"'"),
+		"RADV finds %s, see vulkaninfo.log", node)
+	s.counters(g)
 }
