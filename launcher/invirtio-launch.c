@@ -87,6 +87,7 @@ static const struct {
 	{ "blk", VIRTIO_ID_BLOCK },
 	{ "net", VIRTIO_ID_NET },
 	{ "wlan", VIRTIO_ID_MAC80211_WLAN },
+	{ "gpu", VIRTIO_ID_GPU },
 };
 
 static const char *prog = "invirtio-launch";
@@ -137,11 +138,11 @@ static void usage(void)
 "  -b            bind the devices to vfio-pci if they are not bound to it\n"
 "  -e <type>,<name>,log=<file>\n"
 "                let the guest export the VDUSE device <name> of type blk,\n"
-"                net or wlan, with its in-flight log in <file>. The guest's\n"
-"                vduse_guest.device=<type>,<name> argument gets the log as\n"
-"                log_fd=<n>. <file> must be on a tmpfs, whose size bounds\n"
-"                what the guest can write to it. A name must be exported\n"
-"                by one launcher only. Can be repeated\n"
+"                net, wlan or gpu, with its in-flight log in <file>. The\n"
+"                guest's vduse_guest.device=<type>,<name> argument gets\n"
+"                the log as log_fd=<n>. <file> must be on a tmpfs, whose\n"
+"                size bounds what the guest can write to it. A name must\n"
+"                be exported by one launcher only. Can be repeated\n"
 "  -i <file>     the initramfs, passed as initrd=fd:<n>\n"
 "  -l <MiB>      the guest's RLIMIT_MEMLOCK, which bounds the DMA memory that\n"
 "                each of its processes pins (default 256)\n"
