@@ -17,9 +17,10 @@ import (
 
 func cmdStatus(args []string) error {
 	fs := flag.NewFlagSet("status", flag.ExitOnError)
-	verbose := fs.Bool("v", false, "also show the guest's memory in detail and its VDUSE counters, which needs root")
+	verbose := fs.Bool("v", false, "also show the guest's memory in detail, which needs root for the guest's own view")
+	counters := fs.Bool("vv", false, "also show what -v shows and the guest's VDUSE counters, which needs root")
 	fs.Usage = func() {
-		fmt.Fprintln(os.Stderr, "usage: invirtio status [-v] [<name>]\n\nShow the state of the enabled devices, or of one.")
+		fmt.Fprintln(os.Stderr, "usage: invirtio status [-v | -vv] [<name>]\n\nShow the state of the enabled devices, or of one.")
 		fs.PrintDefaults()
 	}
 	fs.Parse(args)
@@ -50,7 +51,13 @@ func cmdStatus(args []string) error {
 		if i > 0 {
 			fmt.Println()
 		}
-		showDevice(name, cfg.Devices[name], *verbose)
+		level := 0
+		if *counters {
+			level = 2
+		} else if *verbose {
+			level = 1
+		}
+		showDevice(name, cfg.Devices[name], level)
 	}
 	return nil
 }
@@ -63,7 +70,9 @@ func systemctlState(verb, unit string) string {
 	return "unknown"
 }
 
-func showDevice(name string, dev *Device, verbose bool) {
+// showDevice shows a device's state, and with a level of 1 the guest's
+// memory in detail, and with 2 its VDUSE counters too.
+func showDevice(name string, dev *Device, level int) {
 	unit := "invirtio@" + name + ".service"
 	row := func(label, value string) {
 		fmt.Printf("  %-16s %s\n", label+":", value)
@@ -117,7 +126,7 @@ func showDevice(name string, dev *Device, verbose bool) {
 		row("memory", memoryUse(cg))
 	}
 
-	if !verbose {
+	if level < 1 {
 		return
 	}
 	if cg != "" {
@@ -132,6 +141,9 @@ func showDevice(name string, dev *Device, verbose bool) {
 	// only printable text of theirs reaches the terminal.
 	if meminfo, err := mconsole.Request(mconsolePath(name), "proc meminfo"); err == nil {
 		row("guest memory", printable(guestMemory(meminfo)))
+	}
+	if level < 2 {
+		return
 	}
 	text, err := mconsole.Request(mconsolePath(name), "proc vduse_guest")
 	if err != nil {
