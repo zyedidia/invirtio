@@ -1,0 +1,119 @@
+From 6e83cc8bf50163164211f3fcc9a1b36f10261593 Mon Sep 17 00:00:00 2001
+From: Zachary Yedidia <zyedidia@gmail.com>
+Date: Sat, 31 Oct 2026 16:30:16 -0700
+Subject: [PATCH] xf86drm: Treat vDPA devices as platform devices
+
+---
+ xf86drm.c | 74 ++++++++++++++++++++++++++++++++++++++++++++++---------
+ 1 file changed, 63 insertions(+), 11 deletions(-)
+
+diff --git a/xf86drm.c b/xf86drm.c
+index 53d1354..b637336 100644
+--- a/xf86drm.c
++++ b/xf86drm.c
+@@ -3597,6 +3597,7 @@ static int get_subsystem_type(const char *device_path)
+         { "/host1x", DRM_BUS_HOST1X },
+         { "/virtio", DRM_BUS_VIRTIO },
+         { "/faux", DRM_BUS_FAUX },
++        { "/vdpa", DRM_BUS_PLATFORM },
+     };
+ 
+     strncpy(path, device_path, PATH_MAX);
+@@ -4290,6 +4291,43 @@ free_device:
+     return ret;
+ }
+ 
++/*
++ * Return whether a device is a vDPA device, which is the parent of
++ * virtio_gpu's DRM device on virtio_vdpa, and has no OF data and no
++ * modalias.
++ */
++static bool drm_is_vdpa(const char *device_path)
++{
++#ifdef __linux__
++    char path[PATH_MAX + sizeof("/subsystem")], link[PATH_MAX + 1] = "";
++    char *name;
++
++    snprintf(path, sizeof(path), "%s/subsystem", device_path);
++    if (readlink(path, link, PATH_MAX) < 0)
++        return false;
++    name = strrchr(link, '/');
++    return name && !strcmp(name, "/vdpa");
++#else
++    return false;
++#endif
++}
++
++/* Return the name of a vDPA device, or NULL for any other device. */
++static char *drm_vdpa_name(const char *device_path)
++{
++#ifdef __linux__
++    char real_path[PATH_MAX + 1];
++    char *name;
++
++    if (!drm_is_vdpa(device_path) || !realpath(device_path, real_path))
++        return NULL;
++    name = strrchr(real_path, '/');
++    return name ? strdup(name + 1) : NULL;
++#else
++    return NULL;
++#endif
++}
++
+ static int drmParseOFBusInfo(int maj, int min, char *fullname)
+ {
+ #ifdef __linux__
+@@ -4302,16 +4340,21 @@ static int drmParseOFBusInfo(int maj, int min, char *fullname)
+     if (!name) {
+         /* If the device lacks OF data, pick the MODALIAS info */
+         name = sysfs_uevent_get(path, "MODALIAS");
+-        if (!name)
+-            return -ENOENT;
+-
+-        /* .. and strip the MODALIAS=[platform,usb...]: part. */
+-        tmp_name = strrchr(name, ':');
+-        if (!tmp_name) {
+-            free(name);
+-            return -ENOENT;
++        if (!name) {
++            /* A vDPA device is named by its device name. */
++            name = drm_vdpa_name(path);
++            if (!name)
++                return -ENOENT;
++            tmp_name = name;
++        } else {
++            /* .. and strip the MODALIAS=[platform,usb...]: part. */
++            tmp_name = strrchr(name, ':');
++            if (!tmp_name) {
++                free(name);
++                return -ENOENT;
++            }
++            tmp_name++;
+         }
+-        tmp_name++;
+     }
+ 
+     strncpy(fullname, tmp_name, DRM_PLATFORM_DEVICE_NAME_LEN);
+@@ -4354,8 +4397,17 @@ static int drmParseOFDeviceInfo(int maj, int min, char ***compatible)
+             /* If the device lacks OF data, pick the MODALIAS info */
+             value = sysfs_uevent_get(path, "MODALIAS");
+             if (!value) {
+-                err = -ENOENT;
+-                goto free;
++                /* A vDPA device is compatible with vdpa. */
++                if (!drm_is_vdpa(path)) {
++                    err = -ENOENT;
++                    goto free;
++                }
++                (*compatible)[i] = strdup("vdpa");
++                if (!(*compatible)[i]) {
++                    err = -ENOMEM;
++                    goto free;
++                }
++                continue;
+             }
+ 
+             /* .. and strip the MODALIAS=[platform,usb...]: part. */
+-- 
+2.47.3
+
