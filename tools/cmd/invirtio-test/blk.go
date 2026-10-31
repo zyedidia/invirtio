@@ -134,6 +134,7 @@ Tests:`+blkTestList())
 		}
 		s.mu.Unlock()
 		harness.Cleanup(blkName)
+		harness.CloseOutput()
 		os.Exit(1)
 	}()
 
@@ -176,6 +177,9 @@ func (s *blkSuite) setup() error {
 	// A guest with its bounce region in guest pages pins them.
 	unix.Setrlimit(unix.RLIMIT_MEMLOCK, &unix.Rlimit{Cur: unix.RLIM_INFINITY, Max: unix.RLIM_INFINITY})
 	if err := os.MkdirAll(s.out, 0755); err != nil {
+		return err
+	}
+	if err := harness.TeeOutput(filepath.Join(s.out, "test.log")); err != nil {
 		return err
 	}
 	s.disk = filepath.Join(s.out, "disk.img")
@@ -251,7 +255,7 @@ func (s *blkSuite) boot(argv []string) *harness.Guest {
 		return nil
 	}
 	g, err := harness.StartGuest(path, argv...)
-	if !s.Check(err == nil, "guest %d starts: %v", len(s.guests)+1, err) {
+	if !s.Check(err == nil, "guest %d starts%s", len(s.guests)+1, errSuffix(err)) {
 		return nil
 	}
 	s.mu.Lock()
@@ -309,7 +313,7 @@ func (s *blkSuite) waitDisk() string {
 // attach adds the device to the vDPA bus and returns the host's disk.
 func (s *blkSuite) attach() string {
 	err := harness.Attach(blkName)
-	if !s.Check(err == nil, "vdpa dev add attaches the device: %v", err) {
+	if !s.Check(err == nil, "vdpa dev add attaches the device%s", errSuffix(err)) {
 		return ""
 	}
 	return s.waitDisk()
@@ -317,7 +321,7 @@ func (s *blkSuite) attach() string {
 
 func (s *blkSuite) detach() bool {
 	err := harness.Detach(blkName, false)
-	return s.Check(err == nil, "vdpa dev del removes the device: %v", err)
+	return s.Check(err == nil, "vdpa dev del removes the device%s", errSuffix(err))
 }
 
 // run runs a command that uses the disk, which a signal stops.
@@ -341,7 +345,7 @@ func (s *blkSuite) writeDiskFile() bool {
 			err = cerr
 		}
 	}
-	return s.Check(err == nil, "the reference data is written to the disk's file: %v", err)
+	return s.Check(err == nil, "the reference data is written to the disk's file%s", errSuffix(err))
 }
 
 // checkData compares the start of the disk with the reference data.
@@ -381,7 +385,7 @@ func (s *blkSuite) healthy(g *harness.Guest) {
 			}
 		}
 	}
-	s.Check(len(bad) == 0, "the guest's error counters are zero %s", strings.Join(bad, ", "))
+	s.Check(len(bad) == 0, "the guest's error counters are zero%s", listSuffix("but", bad))
 }
 
 func blkTestIO(s *blkSuite) {
@@ -535,7 +539,7 @@ func blkTestStop(s *blkSuite) {
 // long enough for them to be in flight when it dies. It is removed once the
 // test's guests are gone.
 func (s *blkSuite) delayDisk(ms int) bool {
-	if err := harness.Modprobe("dm_delay"); !s.Check(err == nil, "dm-delay loads: %v", err) {
+	if err := harness.Modprobe("dm_delay"); !s.Check(err == nil, "dm-delay loads%s", errSuffix(err)) {
 		return false
 	}
 	r := harness.Run("losetup", "-f", "--show", s.disk)
@@ -547,7 +551,7 @@ func (s *blkSuite) delayDisk(ms int) bool {
 	table := fmt.Sprintf("0 %d delay %s 0 0 %s 0 %d", blkDiskSize/512, loop, loop, ms)
 	if err := harness.MustRun("dmsetup", "create", name, "--table", table); err != nil {
 		harness.Run("losetup", "-d", loop)
-		s.Check(false, "dm-delay delays the disk's writes: %v", err)
+		s.Check(false, "dm-delay delays the disk's writes%s", errSuffix(err))
 		return false
 	}
 	s.after = append(s.after, func() {
@@ -674,7 +678,7 @@ func blkTestTimeout(s *blkSuite) {
 
 func blkTestSandbox(s *blkSuite) {
 	logs, err := os.MkdirTemp("/dev/shm", "vblk-test-")
-	if !s.Check(err == nil, "a directory for the in-flight log is made on a tmpfs: %v", err) {
+	if !s.Check(err == nil, "a directory for the in-flight log is made on a tmpfs%s", errSuffix(err)) {
 		return
 	}
 	defer os.RemoveAll(logs)

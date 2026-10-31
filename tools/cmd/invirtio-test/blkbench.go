@@ -165,6 +165,9 @@ Jobs:`+benchJobList())
 	if err := os.MkdirAll(s.out, 0755); err != nil {
 		return err
 	}
+	if err := harness.TeeOutput(filepath.Join(s.out, "bench.log")); err != nil {
+		return err
+	}
 	if err := harness.Modprobe("vduse", "vdpa", "virtio_vdpa", "virtio_blk"); err != nil {
 		return err
 	}
@@ -386,60 +389,11 @@ func (s *benchSuite) runGuest(t *BenchTarget) error {
 	}
 	pid := g.Pid()
 	if t.Kind == "sandbox" {
-		if pid = benchUMLPid(pid); pid == 0 {
+		if pid = harness.UMLPid(pid); pid == 0 {
 			return errors.New("cannot find the guest's UML process")
 		}
 	}
 	return s.runJobs(t, dev, pid, g)
-}
-
-// benchUMLPid returns the UML process that a launcher started. UML's helper
-// and stub processes share its command line, and UML is the one whose
-// parent, the launcher's init, does not. Only the launcher's descendants
-// count, since invirtio's own guests run UML the same way.
-func benchUMLPid(launcher int) int {
-	isUML := func(pid int) bool {
-		data, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
-		return err == nil && strings.Contains(string(data), "vduse_uml.broker_fd=")
-	}
-	below := func(pid int) bool {
-		for p := benchParent(pid); p > 1; p = benchParent(p) {
-			if p == launcher {
-				return true
-			}
-		}
-		return false
-	}
-	procs, _ := filepath.Glob("/proc/[0-9]*")
-	for _, p := range procs {
-		pid, err := strconv.Atoi(filepath.Base(p))
-		if err != nil || !isUML(pid) || !below(pid) {
-			continue
-		}
-		if ppid := benchParent(pid); ppid > 0 && !isUML(ppid) {
-			return pid
-		}
-	}
-	return 0
-}
-
-// benchParent returns a process's parent, from /proc/<pid>/stat.
-func benchParent(pid int) int {
-	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
-	if err != nil {
-		return 0
-	}
-	stat := string(data)
-	i := strings.LastIndexByte(stat, ')')
-	if i < 0 {
-		return 0
-	}
-	f := strings.Fields(stat[i+1:])
-	if len(f) < 2 {
-		return 0
-	}
-	ppid, _ := strconv.Atoi(f[1])
-	return ppid
 }
 
 // attach adds the device to the vDPA bus, places its interrupt injection,
@@ -461,37 +415,10 @@ func (s *benchSuite) attach(name string) (string, error) {
 		return "", errors.New("the host made no block device")
 	}
 	harness.Run("udevadm", "settle")
-	if err := benchPlaceIRQs(name, s.irqCPU); err != nil {
+	if err := harness.PlaceIRQs(name, s.irqCPU); err != nil {
 		return "", err
 	}
 	return dev, nil
-}
-
-// benchPlaceIRQs sets the CPUs that VDUSE injects each queue's interrupts
-// from. VDUSE loops in the host kernel when it injects on a queue whose
-// affinity has no online CPU, which virtio_vdpa's spread over the present
-// CPUs can leave, so such a queue first gets every online CPU.
-func benchPlaceIRQs(name string, cpu int) error {
-	online, err := benchParseCPUs(harness.Read("/sys/devices/system/cpu/online"))
-	if err != nil {
-		return err
-	}
-	files, _ := filepath.Glob(filepath.Join("/sys/class/vduse", name, "vq*/irq_cb_affinity"))
-	for _, f := range files {
-		mask, err := benchParseMask(harness.Read(f))
-		if err != nil {
-			return err
-		}
-		if cpu >= 0 {
-			mask = benchSetBit(nil, cpu)
-		} else if !benchIntersects(mask, online) {
-			mask = online
-		}
-		if err := harness.Write(f, benchFormatMask(mask)); err != nil {
-			return fmt.Errorf("%s: %v", f, err)
-		}
-	}
-	return nil
 }
 
 // runJobs runs every job against a disk. With a device process, it records
@@ -513,7 +440,7 @@ func (s *benchSuite) runJobs(t *BenchTarget, dev string, pid int, g *harness.Gue
 			}
 			var t0 [2]int64
 			if pid > 0 {
-				t0 = benchTicks(pid)
+				t0 = harness.ProcessTicks(pid)
 			}
 			out := filepath.Join(dir, run+".json")
 			r := harness.RunContext(s.ctx, dir, time.Duration(s.runtime+s.ramp+60)*time.Second, "taskset", "-c", s.fioCPU,
@@ -534,7 +461,7 @@ func (s *benchSuite) runJobs(t *BenchTarget, dev string, pid int, g *harness.Gue
 			}
 			br.Job, br.Rep = j.name, rep
 			if pid > 0 {
-				t1 := benchTicks(pid)
+				t1 := harness.ProcessTicks(pid)
 				br.UserTicks, br.SysTicks, br.HasTicks = t1[0]-t0[0], t1[1]-t0[1], true
 			}
 			if g != nil {
@@ -551,33 +478,6 @@ func (s *benchSuite) runJobs(t *BenchTarget, dev string, pid int, g *harness.Gue
 		}
 	}
 	return nil
-}
-
-// benchTicks returns a process's user and system ticks, over all its
-// threads.
-func benchTicks(pid int) [2]int64 {
-	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
-	if err != nil {
-		return [2]int64{}
-	}
-	return benchParseStat(string(data))
-}
-
-// benchParseStat returns the utime and stime fields of /proc/<pid>/stat.
-// The command name in parentheses can hold spaces, so the fields are counted
-// from after it.
-func benchParseStat(stat string) [2]int64 {
-	i := strings.LastIndexByte(stat, ')')
-	if i < 0 {
-		return [2]int64{}
-	}
-	f := strings.Fields(stat[i+1:])
-	if len(f) < 13 {
-		return [2]int64{}
-	}
-	u, _ := strconv.ParseInt(f[11], 10, 64)
-	st, _ := strconv.ParseInt(f[12], 10, 64)
-	return [2]int64{u, st}
 }
 
 // benchCounterDelta returns the change of each counter between two dumps of
@@ -771,77 +671,4 @@ func benchSummary(r *BenchResults) string {
 		}
 	}
 	return b.String()
-}
-
-// benchParseCPUs parses a CPU list such as 0-3,8 into a mask.
-func benchParseCPUs(list string) ([]uint64, error) {
-	var mask []uint64
-	for _, r := range strings.Split(list, ",") {
-		lo, hi, found := strings.Cut(r, "-")
-		a, err := strconv.Atoi(lo)
-		if err != nil {
-			return nil, fmt.Errorf("cannot parse the CPU list %q", list)
-		}
-		z := a
-		if found {
-			if z, err = strconv.Atoi(hi); err != nil {
-				return nil, fmt.Errorf("cannot parse the CPU list %q", list)
-			}
-		}
-		for c := a; c <= z; c++ {
-			mask = benchSetBit(mask, c)
-		}
-	}
-	return mask, nil
-}
-
-// benchParseMask parses a CPU mask as sysfs prints it, in comma-separated
-// groups of 32 bits, most significant first.
-func benchParseMask(s string) ([]uint64, error) {
-	groups := strings.Split(strings.TrimSpace(s), ",")
-	var mask []uint64
-	for i := range groups {
-		g := groups[len(groups)-1-i]
-		v, err := strconv.ParseUint(g, 16, 32)
-		if err != nil {
-			return nil, fmt.Errorf("cannot parse the CPU mask %q", s)
-		}
-		for bit := 0; bit < 32; bit++ {
-			if v&(1<<bit) != 0 {
-				mask = benchSetBit(mask, 32*i+bit)
-			}
-		}
-	}
-	return mask, nil
-}
-
-func benchFormatMask(mask []uint64) string {
-	var groups []string
-	for i := len(mask) - 1; i >= 0; i-- {
-		groups = append(groups, fmt.Sprintf("%08x", mask[i]>>32), fmt.Sprintf("%08x", mask[i]&0xffffffff))
-	}
-	for len(groups) > 1 && groups[0] == "00000000" {
-		groups = groups[1:]
-	}
-	if len(groups) == 0 {
-		return "00000000"
-	}
-	return strings.Join(groups, ",")
-}
-
-func benchSetBit(mask []uint64, bit int) []uint64 {
-	for len(mask) <= bit/64 {
-		mask = append(mask, 0)
-	}
-	mask[bit/64] |= 1 << (bit % 64)
-	return mask
-}
-
-func benchIntersects(a, b []uint64) bool {
-	for i := range a {
-		if i < len(b) && a[i]&b[i] != 0 {
-			return true
-		}
-	}
-	return false
 }

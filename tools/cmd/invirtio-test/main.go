@@ -13,6 +13,9 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"strings"
+
+	"invirtio/internal/harness"
 )
 
 type command struct {
@@ -46,7 +49,26 @@ func usage() {
 
 func fatal(format string, args ...any) {
 	fmt.Fprintf(os.Stderr, "invirtio-test: "+format+"\n", args...)
+	harness.CloseOutput()
 	os.Exit(1)
+}
+
+// errSuffix formats an error for the end of a check's message, which
+// shows it only when there is one.
+func errSuffix(err error) string {
+	if err == nil {
+		return ""
+	}
+	return ": " + err.Error()
+}
+
+// listSuffix formats a list for the end of a check's message, after a
+// word that introduces it, and shows nothing for an empty list.
+func listSuffix(word string, items []string) string {
+	if len(items) == 0 {
+		return ""
+	}
+	return ", " + word + " " + strings.Join(items, ", ")
 }
 
 func requireRoot() {
@@ -66,4 +88,5 @@ func main() {
 	if err := c.run(os.Args[2:]); err != nil {
 		fatal("%v", err)
 	}
+	harness.CloseOutput()
 }

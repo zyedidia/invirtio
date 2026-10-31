@@ -85,6 +85,11 @@ func Run(name string, args ...string) Result {
 	return RunTimeout(0, name, args...)
 }
 
+// RunArgv runs a command given as one list, such as one from InNS.
+func RunArgv(argv []string) Result {
+	return Run(argv[0], argv[1:]...)
+}
+
 // RunTimeout runs a command and kills it if it outlives the timeout, unless
 // the timeout is 0.
 func RunTimeout(timeout time.Duration, name string, args ...string) Result {
@@ -244,6 +249,27 @@ func RepoRoot() string {
 // PCIDriver returns the driver of a PCI device, or "".
 func PCIDriver(addr string) string { return pci.Driver(addr) }
 
+// PCIHolders returns the processes that hold the VFIO group of a PCI
+// device open.
+func PCIHolders(addr string) []int {
+	group, err := pci.IOMMUGroup(addr)
+	if err != nil {
+		return nil
+	}
+	dev := "/dev/vfio/" + group
+	var pids []int
+	fds, _ := filepath.Glob("/proc/[0-9]*/fd/*")
+	for _, fd := range fds {
+		if link, err := os.Readlink(fd); err == nil && link == dev {
+			pid, _ := strconv.Atoi(strings.Split(fd, "/")[2])
+			if len(pids) == 0 || pids[len(pids)-1] != pid {
+				pids = append(pids, pid)
+			}
+		}
+	}
+	return pids
+}
+
 // PCINetdev returns the network interface of a PCI device, or "".
 func PCINetdev(addr string) string {
 	nets := Glob(pci.Path(addr, "net/*"))
@@ -392,7 +418,8 @@ func (g *Guest) Output(line string, timeout time.Duration) string {
 	if i < 0 || j < i {
 		return ""
 	}
-	return log[i+len(start) : j]
+	// The console ends its lines with a carriage return too.
+	return strings.ReplaceAll(log[i+len(start):j], "\r", "")
 }
 
 var (

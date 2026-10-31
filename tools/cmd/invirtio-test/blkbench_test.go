@@ -28,39 +28,12 @@ func TestBenchParseFio(t *testing.T) {
 	}
 }
 
-func TestBenchParseStat(t *testing.T) {
-	stat := "1234 (linux (uml) x) S 1 1234 1234 0 -1 4194560 100 0 0 0 250 75 0 0 20 0 3 0"
-	if got := benchParseStat(stat); got != [2]int64{250, 75} {
-		t.Errorf("benchParseStat = %v", got)
-	}
-}
-
 func TestBenchCounterDelta(t *testing.T) {
 	before := "device vblk-bench\n  starts 1\n  queue 0\n    kicks 10\n    requests 100\n  queue 1\n    kicks 5\n    requests 50\n"
 	after := "device vblk-bench\n  starts 1\n  queue 0\n    kicks 15\n    requests 300\n  queue 1\n    kicks 6\n    requests 80\n"
 	d := benchCounterDelta(before, after)
 	if d["kicks"] != 6 || d["requests"] != 230 || d["polled"] != 0 {
 		t.Errorf("benchCounterDelta = %v", d)
-	}
-}
-
-func TestBenchMasks(t *testing.T) {
-	m, err := benchParseCPUs("0-3,8,40")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := benchFormatMask(m); got != "00000100,0000010f" {
-		t.Errorf("format = %q", got)
-	}
-	p, err := benchParseMask("00000100,0000010f")
-	if err != nil || benchFormatMask(p) != "00000100,0000010f" {
-		t.Errorf("parse = %v, %v", p, err)
-	}
-	if got := benchFormatMask(benchSetBit(nil, 3)); got != "00000008" {
-		t.Errorf("one CPU = %q", got)
-	}
-	if !benchIntersects(m, benchSetBit(nil, 40)) || benchIntersects(m, benchSetBit(nil, 5)) {
-		t.Error("benchIntersects is wrong")
 	}
 }
 
