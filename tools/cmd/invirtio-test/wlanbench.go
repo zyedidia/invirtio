@@ -218,16 +218,22 @@ busybox.`)
 	return os.WriteFile(filepath.Join(s.out, "summary.txt"), []byte(summary), 0644)
 }
 
-// wiphy waits for a wiphy and an interface under a device directory.
+// wiphy waits for a wiphy and an interface under a device directory, and
+// for udev to rename the interface.
 func wiphy(dir string) (phy, net string) {
-	harness.Wait(func() bool {
+	find := func() bool {
 		phys := harness.Glob(filepath.Join(dir, "ieee80211/*"))
 		nets := harness.Glob(filepath.Join(dir, "net/*"))
+		phy, net = "", ""
 		if len(phys) > 0 && len(nets) > 0 {
-			phy, net = filepath.Base(phys[0]), filepath.Base(nets[0])
+			phy, net = phys[0], nets[0]
 		}
 		return net != ""
-	}, 30*time.Second, 100*time.Millisecond)
+	}
+	if harness.Wait(find, 30*time.Second, 100*time.Millisecond) {
+		harness.Run("udevadm", "settle")
+		find()
+	}
 	return phy, net
 }
 

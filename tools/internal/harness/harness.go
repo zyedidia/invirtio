@@ -270,6 +270,16 @@ func PCIHolders(addr string) []int {
 	return pids
 }
 
+// WaitNetdev waits for a PCI device's driver to register its network
+// interface and for udev to rename it, and returns its name, or "".
+func WaitNetdev(addr string, timeout time.Duration) string {
+	if !Wait(func() bool { return PCINetdev(addr) != "" }, timeout, 100*time.Millisecond) {
+		return ""
+	}
+	Run("udevadm", "settle")
+	return PCINetdev(addr)
+}
+
 // PCINetdev returns the network interface of a PCI device, or "".
 func PCINetdev(addr string) string {
 	nets := Glob(pci.Path(addr, "net/*"))

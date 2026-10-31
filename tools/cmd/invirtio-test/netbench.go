@@ -257,8 +257,7 @@ func (s *netBenchSuite) runNative(t *NetBenchTarget) error {
 			return err
 		}
 	}
-	var port string
-	harness.Wait(func() bool { port = harness.PCINetdev(netGuestPort); return port != "" }, 10*time.Second, 100*time.Millisecond)
+	port := harness.WaitNetdev(netGuestPort, 10*time.Second)
 	if port == "" {
 		return fmt.Errorf("%s has no interface on the host", netGuestPort)
 	}
