@@ -128,7 +128,7 @@ busybox.`)
 	noServer := fs.Bool("no-server", false, "use an iperf3 server that already runs")
 	reps := fs.Int("reps", 3, "the repetitions of each direction")
 	seconds := fs.Int("time", 10, "the seconds that each iperf3 run takes")
-	mem := fs.String("mem", "768M", "the guest's memory, as UML's mem= takes it")
+	mem := fs.String("mem", "256M", "the guest's memory, as UML's mem= takes it")
 	fs.Parse(args)
 	targets := fs.Args()
 	if len(targets) == 0 {
