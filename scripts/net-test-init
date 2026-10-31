@@ -1,0 +1,55 @@
+#!/bin/sh
+# The init script of a virtio-net test guest, for mkinitramfs.sh -i. With
+# veth_test on the kernel command line, the guest exports veth0 of a veth
+# pair with an MTU of 9000, and veth1 is the far end, with the address
+# 10.72.0.2/24 and an iperf3 server. Without it, the guest exports the NIC
+# that it drives, and the far end is elsewhere.
+#
+# The backend looks for its interface during boot, so the kernel runs this
+# script as its uevent helper too, and the first run that sees veth_test
+# makes the pair. As init, the script prints "net-test-init: ready" once the
+# far end is set up, then starts a shell with init_shell on the kernel
+# command line, and otherwise waits until the guest is stopped.
+
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
+has() {
+	case " $(cat /proc/cmdline) " in
+	*" $1 "*) return 0 ;;
+	esac
+	return 1
+}
+
+if [ $$ -ne 1 ]; then
+	[ -e /proc/cmdline ] || mount -t proc proc /proc 2>/dev/null
+	if has veth_test && mkdir /veth-test 2>/dev/null; then
+		ip link add veth0 mtu 9000 type veth peer name veth1 mtu 9000
+		ip addr add 10.72.0.2/24 dev veth1
+		ip link set veth1 up
+		iperf3 -s -D --logfile /tmp/iperf3.log
+		touch /veth-test/done
+	fi
+	exit 0
+fi
+
+[ -e /proc/cmdline ] || mount -t proc proc /proc
+mount -t devtmpfs devtmpfs /dev
+mount -t sysfs sysfs /sys
+echo > /sys/kernel/uevent_helper
+
+if has veth_test; then
+	while [ ! -e /veth-test/done ]; do
+		sleep 0.1
+	done
+fi
+echo "net-test-init: ready"
+
+if has init_shell; then
+	while :; do
+		setsid cttyhack sh
+		sleep 1
+	done
+fi
+while :; do
+	sleep 3600
+done

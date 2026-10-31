@@ -11,6 +11,13 @@
 #                 sandbox, which serves a ubd disk backed by a host file.
 #   blk-bench     the guest that invirtio-test bench-blk runs, with and
 #                 without the sandbox, which serves its own null_blk.
+#   net-test      the guest that invirtio-test test-net runs, which exports
+#                 one end of a veth pair, or a port of the X710 or I226-V.
+#   net-bench     the guest that invirtio-test bench-net runs, which
+#                 exports a port of the X710.
+#   wlan-test     the guest that invirtio-test test-wlan runs, which exports
+#                 a mac80211_hwsim radio and runs access points on three
+#                 others.
 #
 # usage: invirtio-build-guest.sh [-t <target>] [<build dir>]
 #
@@ -21,6 +28,9 @@
 
 set -euo pipefail
 
+# The tools that the test guests take are in sbin, which a user's PATH can
+# leave out.
+export PATH=$PATH:/usr/sbin:/sbin
 ROOT=$(realpath "$(dirname "$0")/..")
 SRC=$ROOT/linux-uml/linux
 CONFIGS=$ROOT/configs
@@ -29,7 +39,7 @@ TARGET=invirtio
 while getopts t:h opt; do
     case $opt in
     t) TARGET=$OPTARG ;;
-    *) sed -n '2,21s/^# \{0,1\}//p' "$0" >&2; exit 2 ;;
+    *) sed -n '2,29s/^# \{0,1\}//p' "$0" >&2; exit 2 ;;
     esac
 done
 shift $((OPTIND - 1))
@@ -50,6 +60,21 @@ blk-test-ubd)
 blk-bench)
     FRAGMENTS=(driver-guest blk-bench)
     INITRAMFS=()
+    ;;
+net-test)
+    FRAGMENTS=(driver-guest net-guest net-test lockdep)
+    INITRAMFS=(-i "$ROOT/scripts/net-test-init" -b "$(command -v iperf3)"
+               -b "$(command -v ip)")
+    ;;
+net-bench)
+    FRAGMENTS=(driver-guest net-guest)
+    INITRAMFS=()
+    ;;
+wlan-test)
+    FRAGMENTS=(driver-guest wlan-guest wlan-hwsim lockdep)
+    INITRAMFS=(-i "$ROOT/scripts/wlan-hwsim-init" -d cfg80211
+               -b "$(command -v hostapd)" -b "$(command -v iperf3)"
+               -b "$(command -v iw)")
     ;;
 *)
     echo "${0##*/}: unknown target $TARGET" >&2
