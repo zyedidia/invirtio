@@ -123,6 +123,19 @@ static void gpu_init(struct gpu *g, const char *node,
 	      "vkCreateCommandPool");
 }
 
+/*
+ * The flags of host-visible memory in GTT, which RADV gives cached memory,
+ * or with vram, in CPU-visible VRAM, which RADV gives device-local memory.
+ */
+static inline VkMemoryPropertyFlags host_visible_flags(int vram)
+{
+	VkMemoryPropertyFlags flags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+				      VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+
+	return flags | (vram ? VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT :
+			       VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
+}
+
 static void gpu_destroy(struct gpu *g)
 {
 	vkDestroyCommandPool(g->dev, g->pool, NULL);

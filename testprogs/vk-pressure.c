@@ -1,17 +1,19 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * Use more host-visible memory than the GTT of the GPU's driver holds, with
- * Vulkan on the device of a DRM render node, so that the driver evicts
- * buffers to make room for the ones in use. The program allocates buffers of
- * BUF bytes until they hold a quarter more than the GTT size that it is
- * given, fills each through its mapping, and in each of PASSES passes checks
- * and refills every buffer through its mapping. The buffers are only
- * accessed by the CPU meanwhile, since a submission needs every buffer of the
- * device resident. The program then frees all but the first buffer, fills
- * its second half on the GPU and checks it.
+ * Use more host-visible memory than the GTT of the GPU's driver holds, or with
+ * vram, than its CPU-visible VRAM, with Vulkan on the device of a DRM render
+ * node, so that the driver evicts buffers to make room for the ones in use.
+ * The program allocates buffers of BUF bytes until they hold a quarter more
+ * than the size that it is given, fills each through its mapping, and in
+ * each of PASSES passes checks and refills every buffer through its mapping.
+ * The buffers are only accessed by the CPU meanwhile, since a submission
+ * needs every buffer of the device resident. The program then frees all but
+ * the first buffer, fills its second half on the GPU and checks it.
  *
- * usage: vk-pressure <render node> <GTT size in bytes>
+ * usage: vk-pressure <render node> <size in bytes> [vram]
  */
+#include <string.h>
+
 #include "vkutil.h"
 
 #define BUF (64ull << 20)
@@ -67,7 +69,8 @@ int main(int argc, char **argv)
 	VkDeviceMemory mem[MAX_BUFS];
 	volatile uint64_t *p[MAX_BUFS];
 	VkMemoryRequirements req;
-	unsigned long long gtt;
+	unsigned long long size;
+	int vram;
 	unsigned int n, i, pass;
 	const volatile uint32_t *q;
 	uint32_t type;
@@ -78,15 +81,16 @@ int main(int argc, char **argv)
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	prog = "vk-pressure";
 	role = "main";
-	if (argc != 3 || !(gtt = strtoull(argv[2], NULL, 0))) {
-		fprintf(stderr, "usage: %s <render node> <GTT size in bytes>\n",
+	vram = argc == 4 && !strcmp(argv[3], "vram");
+	if ((argc != 3 && !vram) || !(size = strtoull(argv[2], NULL, 0))) {
+		fprintf(stderr, "usage: %s <render node> <size in bytes> [vram]\n",
 			prog);
 		return 2;
 	}
-	n = (gtt + gtt / 4) / BUF + 1;
+	n = (size + size / 4) / BUF + 1;
 	if (n > MAX_BUFS) {
-		fprintf(stderr, "%s: main: a GTT of %llu MiB needs more than %d buffers\n",
-			prog, gtt >> 20, MAX_BUFS);
+		fprintf(stderr, "%s: main: a size of %llu MiB needs more than %d buffers\n",
+			prog, size >> 20, MAX_BUFS);
 		return 1;
 	}
 	gpu_init(&g, argv[1], NULL, 0);
@@ -99,13 +103,9 @@ int main(int argc, char **argv)
 	};
 	check(vkCreateBuffer(g.dev, &bci, NULL, &b), "vkCreateBuffer");
 	vkGetBufferMemoryRequirements(g.dev, b, &req);
-	/* RADV places cached host-visible memory in GTT. */
-	type = memory_type(&g, req.memoryTypeBits,
-			   VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-			   VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
-			   VK_MEMORY_PROPERTY_HOST_CACHED_BIT, 1);
-	printf("%s: main: %u buffers of %llu MiB for a GTT of %llu MiB\n", prog,
-	       n, BUF >> 20, gtt >> 20);
+	type = memory_type(&g, req.memoryTypeBits, host_visible_flags(vram), 1);
+	printf("%s: main: %u buffers of %llu MiB for %llu MiB of %s\n", prog, n,
+	       BUF >> 20, size >> 20, vram ? "visible VRAM" : "GTT");
 
 	for (i = 0; i < n; i++) {
 		VkMemoryAllocateInfo mai = {

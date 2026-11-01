@@ -6,10 +6,13 @@
  * after its memory was evicted. A round checks the buffer through the
  * mapping, refills its first half through the mapping and its second half on
  * the GPU, and checks it again. The program prints a line that ends in
- * "ready" before each round and exits at the end of stdin.
+ * "ready" before each round and exits at the end of stdin. With vram, the
+ * buffer is in CPU-visible VRAM, and otherwise in GTT.
  *
- * usage: vk-evict <render node>
+ * usage: vk-evict <render node> [vram]
  */
+#include <string.h>
+
 #include "vkutil.h"
 
 #define SIZE (4 << 20)
@@ -69,8 +72,8 @@ int main(int argc, char **argv)
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	prog = "vk-evict";
 	role = "main";
-	if (argc != 2) {
-		fprintf(stderr, "usage: %s <render node>\n", prog);
+	if ((argc != 2 && argc != 3) || (argc == 3 && strcmp(argv[2], "vram"))) {
+		fprintf(stderr, "usage: %s <render node> [vram]\n", prog);
 		return 2;
 	}
 	gpu_init(&g, argv[1], NULL, 0);
@@ -83,15 +86,11 @@ int main(int argc, char **argv)
 	};
 	check(vkCreateBuffer(g.dev, &bci, NULL, &b), "vkCreateBuffer");
 	vkGetBufferMemoryRequirements(g.dev, b, &req);
-	/* RADV places cached host-visible memory in GTT. */
 	VkMemoryAllocateInfo mai = {
 		.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
 		.allocationSize = req.size,
 		.memoryTypeIndex = memory_type(&g, req.memoryTypeBits,
-					       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-					       VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
-					       VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
-					       1),
+					       host_visible_flags(argc == 3), 1),
 	};
 	check(vkAllocateMemory(g.dev, &mai, NULL, &mem), "vkAllocateMemory");
 	check(vkBindBufferMemory(g.dev, b, mem, 0), "vkBindBufferMemory");
