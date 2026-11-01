@@ -83,7 +83,7 @@ the disk the host runs from cannot be taken away.`)
 	if err := pci.CheckGroup(addr); err != nil {
 		fmt.Fprintf(os.Stderr, "invirtio-test: %v, so bind those too\n", err)
 	}
-	if drv := pci.Driver(addr); drv == "vfio-pci" {
+	if drv := pci.Driver(addr); drv == "vfio-pci" && !pci.IsDisplay(addr) {
 		fmt.Printf("%s is already bound to vfio-pci\n", addr)
 		return nil
 	} else if drv != "" {

@@ -12,6 +12,8 @@ import (
 	"regexp"
 	"strings"
 
+	"golang.org/x/sys/unix"
+
 	"invirtio/internal/sysfs"
 )
 
@@ -178,14 +180,30 @@ func InUse(addr string) []string {
 
 // BindVFIO moves a device from its host driver to vfio-pci. driver_override
 // is set first, so that the device cannot go back to its own driver once it
-// is unbound.
+// is unbound. A display controller that is already on vfio-pci is bound
+// again, since it may have latched the default disable_idle_d3. The rebind
+// holds the device's VFIO group, so that no other process opens it
+// meanwhile. It fails if another process holds the group, which it does
+// while it has the device open, and the unbind would wait for that.
 func BindVFIO(addr string) error {
 	if Driver(addr) == "vfio-pci" {
-		return nil
+		if !IsDisplay(addr) {
+			return nil
+		}
+		group, err := holdGroup(addr)
+		if err != nil {
+			return err
+		}
+		defer group.Close()
 	}
 	if err := exec.Command("modprobe", "vfio-pci").Run(); err != nil {
 		return fmt.Errorf("cannot load vfio-pci: %v", err)
 	}
+	restore, err := keepD0(addr)
+	if err != nil {
+		return err
+	}
+	defer restore()
 	if err := sysfs.Write(Path(addr, "driver_override"), "vfio-pci"); err != nil {
 		return err
 	}
@@ -199,6 +217,61 @@ func BindVFIO(addr string) error {
 		return fmt.Errorf("binding %s to vfio-pci failed, its driver is %q", addr, drv)
 	}
 	return nil
+}
+
+// IsDisplay reports whether a device is a display controller.
+func IsDisplay(addr string) bool {
+	class, err := sysfs.Read(Path(addr, "class"))
+	return err == nil && strings.HasPrefix(class, "0x03")
+}
+
+// holdGroup opens the device's VFIO group, which one process can open at a
+// time, and fails if another process holds it.
+func holdGroup(addr string) (*os.File, error) {
+	group, err := IOMMUGroup(addr)
+	if err != nil {
+		return nil, err
+	}
+	f, err := os.OpenFile("/dev/vfio/"+group, os.O_RDWR, 0)
+	if err != nil {
+		return nil, fmt.Errorf("cannot bind %s again to keep it in D0, cannot open its VFIO group: %v", addr, err)
+	}
+	return f, nil
+}
+
+// keepD0 sets disable_idle_d3 for the binding of a display controller, and
+// the returned function restores it. An APU's GPU loses the state that its
+// firmware set up at boot when it enters D3, which vfio-pci puts an idle
+// device in, and vfio-pci latches the parameter for each device that it
+// binds. The parameter is locked with flock while it is set, as the
+// launcher locks it, so that two binders do not restore each other's value.
+func keepD0(addr string) (func(), error) {
+	const param = "/sys/module/vfio_pci/parameters/disable_idle_d3"
+	if !IsDisplay(addr) {
+		return func() {}, nil
+	}
+	lock, err := os.Open(param)
+	if err != nil {
+		return nil, err
+	}
+	if err := unix.Flock(int(lock.Fd()), unix.LOCK_EX); err != nil {
+		lock.Close()
+		return nil, err
+	}
+	old, err := sysfs.Read(param)
+	if err == nil {
+		err = sysfs.Write(param, "Y")
+	}
+	if err != nil {
+		lock.Close()
+		return nil, err
+	}
+	return func() {
+		if err := sysfs.Write(param, old); err != nil {
+			fmt.Fprintf(os.Stderr, "cannot restore %s to %s: %v\n", param, old, err)
+		}
+		lock.Close()
+	}, nil
 }
 
 // BindNative returns a device to the host driver that matches it. Clearing
