@@ -1,10 +1,12 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -104,6 +106,7 @@ var gpuTests = []gpuTest{
 	{"native", "with -device, RADV and radeonsi drive the iGPU through native context", gpuTestNative},
 	{"render", "with -device, vkmark renders headless through RADV and native context", gpuTestRender},
 	{"share", "with -device, two processes share a buffer through a dma-buf and use it on the GPU", gpuTestShare},
+	{"evict", "with -device, a host-visible buffer keeps its contents across evictions from GTT in the guest", gpuTestEvict},
 	{"deqp", "with -device, dEQP's synchronization and external memory tests pass through native context", gpuTestDeqp},
 }
 
@@ -1059,4 +1062,130 @@ func gpuTestShare(s *gpuSuite) {
 	}, 10*time.Second, 200*time.Millisecond)
 	s.Check(ok, "the guest frees the shared buffer's resource once both processes exit")
 	s.counters(g)
+}
+
+// gpuTestEvict runs testprogs/vk-evict, whose host-visible buffer the guest
+// evicts from GTT before each of its rounds. An eviction unmaps the buffer
+// from the region, and the program's next access faults and maps it again.
+func gpuTestEvict(s *gpuSuite) {
+	const rounds = 2
+	if s.device == "" {
+		fmt.Println("the evict test needs -device, so it is skipped")
+		return
+	}
+	prog := filepath.Join(harness.RepoRoot(), "build/vk-evict")
+	if !s.Check(harness.Exists(prog), "%s is built, with make -C testprogs", prog) {
+		return
+	}
+	if !s.Check(harness.Exists(filepath.Join(s.mesa, "lib/libvulkan_radeon.so")),
+		"the Mesa prefix %s is built", s.mesa) {
+		return
+	}
+	g := s.start()
+	if g == nil {
+		return
+	}
+	node := s.attach()
+	if node == "" {
+		return
+	}
+	log, err := os.Create(filepath.Join(s.dir, "evict.log"))
+	if !s.Check(err == nil, "the test creates evict.log%s", errSuffix(err)) {
+		return
+	}
+	defer log.Close()
+	ctx, cancel := context.WithTimeout(s.ctx, 2*time.Minute)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, prog, node)
+	cmd.Env = s.mesaEnv()
+	cmd.Stderr = log
+	stdin, err := cmd.StdinPipe()
+	var stdout io.ReadCloser
+	if err == nil {
+		stdout, err = cmd.StdoutPipe()
+	}
+	if err == nil {
+		err = cmd.Start()
+	}
+	if !s.Check(err == nil, "%s starts%s", prog, errSuffix(err)) {
+		return
+	}
+	lines := make(chan string)
+	go func() {
+		defer close(lines)
+		sc := bufio.NewScanner(stdout)
+		for sc.Scan() {
+			fmt.Fprintln(log, sc.Text())
+			lines <- sc.Text()
+		}
+	}()
+	s.evictRounds(ctx, g, rounds, stdin, lines)
+	// The program exits at the end of its input, and its output is read to
+	// the end before it is waited for.
+	stdin.Close()
+	for range lines {
+	}
+	err = cmd.Wait()
+	s.Check(err == nil, "%s exits%s, see evict.log", prog, errSuffix(err))
+
+	c := g.Counters()
+	s.Check(c["faults_refused"] == 0, "the guest refuses no fault, not %d", c["faults_refused"])
+	ok := harness.Wait(func() bool {
+		v, ok := g.Counters()["resources"]
+		return ok && v == 0
+	}, 10*time.Second, 200*time.Millisecond)
+	s.Check(ok, "the guest frees the buffer's resource once the program exits")
+	s.counters(g)
+}
+
+// evictRounds evicts the guest's GTT before each round of vk-evict, and
+// checks that the eviction unmaps the program's buffer and that the round
+// maps it again through faults.
+func (s *gpuSuite) evictRounds(ctx context.Context, g *harness.Guest, rounds int,
+	stdin io.Writer, lines <-chan string) {
+	// next waits for the program's next line that holds text, and reports
+	// whether it printed one.
+	next := func(text string) bool {
+		for {
+			select {
+			case line, ok := <-lines:
+				if !ok {
+					return false
+				}
+				if strings.Contains(line, text) {
+					return true
+				}
+			case <-ctx.Done():
+				return false
+			}
+		}
+	}
+	for round := 0; round < rounds; round++ {
+		if !s.Check(next(fmt.Sprintf("round %d ready", round)),
+			"vk-evict starts round %d, see evict.log", round) {
+			return
+		}
+		before := g.Counters()
+		out := g.Output("cat /sys/kernel/debug/dri/*/amdgpu_evict_gtt", 30*time.Second)
+		fields := strings.Fields(out)
+		s.Check(len(fields) > 0 && strings.Trim(strings.Join(fields, ""), "0") == "",
+			"the guest evicts its GTT, %q", strings.TrimSpace(out))
+		evicted := g.Counters()
+		s.Check(evicted["moves"] > before["moves"],
+			"the eviction unmaps the buffer, %d moves", evicted["moves"]-before["moves"])
+
+		if _, err := io.WriteString(stdin, "\n"); !s.Check(err == nil,
+			"the test starts round %d%s", round, errSuffix(err)) {
+			return
+		}
+		if !s.Check(next(fmt.Sprintf("round %d: the buffer holds its patterns", round+1)),
+			"round %d keeps the buffer's contents, see evict.log", round) {
+			return
+		}
+		after := g.Counters()
+		s.Check(after["faults"] > evicted["faults"] &&
+			after["msg_shm_fault"] > evicted["msg_shm_fault"],
+			"the round's accesses map the buffer again through faults, %d faults",
+			after["faults"]-evicted["faults"])
+	}
 }
