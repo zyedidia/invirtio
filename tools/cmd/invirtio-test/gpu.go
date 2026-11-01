@@ -104,6 +104,7 @@ var gpuTests = []gpuTest{
 	{"native", "with -device, RADV and radeonsi drive the iGPU through native context", gpuTestNative},
 	{"render", "with -device, vkmark renders headless through RADV and native context", gpuTestRender},
 	{"share", "with -device, two processes share a buffer through a dma-buf and use it on the GPU", gpuTestShare},
+	{"deqp", "with -device, dEQP's synchronization and external memory tests pass through native context", gpuTestDeqp},
 }
 
 type gpuSuite struct {
@@ -867,14 +868,19 @@ func gpuTestMap(s *gpuSuite) {
 	s.Check(err == nil, "vdpa dev del removes the device of the dead guest%s", errSuffix(err))
 }
 
-// mesaEnv returns an environment that uses the Mesa prefix, as
-// scripts/mesa-env.sh sets up.
+// mesaEnv returns an environment that uses the suite's Mesa prefix.
 func (s *gpuSuite) mesaEnv() []string {
+	return mesaEnviron(s.mesa)
+}
+
+// mesaEnviron returns an environment that uses a Mesa prefix, as
+// scripts/mesa-env.sh sets up.
+func mesaEnviron(prefix string) []string {
 	return append(os.Environ(),
-		"LD_LIBRARY_PATH="+filepath.Join(s.mesa, "lib"),
-		"VK_DRIVER_FILES="+filepath.Join(s.mesa, "share/vulkan/icd.d/radeon_icd.x86_64.json"),
-		"__EGL_VENDOR_LIBRARY_FILENAMES="+filepath.Join(s.mesa, "share/glvnd/egl_vendor.d/50_mesa.json"),
-		"GBM_BACKENDS_PATH="+filepath.Join(s.mesa, "lib/gbm"))
+		"LD_LIBRARY_PATH="+filepath.Join(prefix, "lib"),
+		"VK_DRIVER_FILES="+filepath.Join(prefix, "share/vulkan/icd.d/radeon_icd.x86_64.json"),
+		"__EGL_VENDOR_LIBRARY_FILENAMES="+filepath.Join(prefix, "share/glvnd/egl_vendor.d/50_mesa.json"),
+		"GBM_BACKENDS_PATH="+filepath.Join(prefix, "lib/gbm"))
 }
 
 // gpuTestMesa checks that libdrm reports the render node, whose parent is a
