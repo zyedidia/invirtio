@@ -103,6 +103,7 @@ var gpuTests = []gpuTest{
 	{"mesa", "RADV from scripts/mesa-build.sh finds the render node", gpuTestMesa},
 	{"native", "with -device, RADV and radeonsi drive the iGPU through native context", gpuTestNative},
 	{"render", "with -device, vkmark renders headless through RADV and native context", gpuTestRender},
+	{"share", "with -device, two processes share a buffer through a dma-buf and use it on the GPU", gpuTestShare},
 }
 
 type gpuSuite struct {
@@ -1010,5 +1011,46 @@ func gpuTestRender(s *gpuSuite) {
 	// itself would leave the guest's count nearly unchanged.
 	served := s.commands(g) - before
 	s.Check(before >= 0 && served > 1000, "the guest serves vkmark's commands, %d", served)
+	s.counters(g)
+}
+
+// gpuTestShare runs testprogs/vk-dmabuf-share, in which one process fills a
+// buffer on the GPU and exports it as a dma-buf, and another, with its own
+// DRM file and so its own context in the guest, imports it and copies it on
+// the GPU. The guest attaches the buffer's resource to the second context.
+func gpuTestShare(s *gpuSuite) {
+	if s.device == "" {
+		fmt.Println("the share test needs -device, so it is skipped")
+		return
+	}
+	prog := filepath.Join(harness.RepoRoot(), "build/vk-dmabuf-share")
+	if !s.Check(harness.Exists(prog), "%s is built, with make -C testprogs", prog) {
+		return
+	}
+	if !s.Check(harness.Exists(filepath.Join(s.mesa, "lib/libvulkan_radeon.so")),
+		"the Mesa prefix %s is built", s.mesa) {
+		return
+	}
+	g := s.start()
+	if g == nil {
+		return
+	}
+	node := s.attach()
+	if node == "" {
+		return
+	}
+
+	before := s.commands(g)
+	// Both processes take the Vulkan device of the guest's render node, not
+	// a GPU that the host drives itself.
+	out := s.runMesa("share.log", prog, node)
+	s.Check(strings.Contains(out, "importer: the buffer holds the exporter's pattern"),
+		"the importer reads the exporter's pattern, see share.log")
+	s.Check(before >= 0 && s.commands(g) > before, "the guest serves both processes' commands")
+	ok := harness.Wait(func() bool {
+		v, ok := g.Counters()["resources"]
+		return ok && v == 0
+	}, 10*time.Second, 200*time.Millisecond)
+	s.Check(ok, "the guest frees the shared buffer's resource once both processes exit")
 	s.counters(g)
 }
