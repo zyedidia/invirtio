@@ -106,8 +106,8 @@ var gpuTests = []gpuTest{
 	{"native", "with -device, RADV and radeonsi drive the iGPU through native context", gpuTestNative},
 	{"render", "with -device, vkmark renders headless through RADV and native context", gpuTestRender},
 	{"share", "with -device, two processes share a buffer through a dma-buf and use it on the GPU", gpuTestShare},
-	{"evict", "with -device, a host-visible buffer keeps its contents across evictions from GTT in the guest", gpuTestEvict},
-	{"pressure", "with -device, host-visible buffers that exceed GTT keep their contents while the guest evicts them on its own", gpuTestPressure},
+	{"evict", "with -device, a host-visible buffer keeps its contents across evictions from GTT, or with -vram from VRAM, in the guest", gpuTestEvict},
+	{"pressure", "with -device, host-visible buffers that exceed GTT, or with -vram visible VRAM, keep their contents while the guest evicts them on its own", gpuTestPressure},
 	{"deqp", "with -device, dEQP's synchronization and external memory tests pass through native context", gpuTestDeqp},
 }
 
@@ -120,6 +120,9 @@ type gpuSuite struct {
 	device string
 	// mesa is the prefix of the Mesa that scripts/mesa-build.sh built.
 	mesa string
+	// vram sets the backend's vram option, which places mappable BOs in
+	// CPU-visible VRAM when Mesa asks for VRAM.
+	vram bool
 	// The test that runs, its directory, the directory of its in-flight
 	// log, and the guests it started, which a second signal kills. Ctx ends
 	// on a signal.
@@ -166,8 +169,9 @@ Tests:`+gpuTestList())
 	rom := fs.String("rom", "", "the VBIOS image of the iGPU")
 	mesa := fs.String("mesa", filepath.Join(root, "build/mesa"), "the prefix of the Mesa that scripts/mesa-build.sh built")
 	runRE := fs.String("run", "", "run only the tests whose names match this regular expression")
+	vram := fs.Bool("vram", false, "with -device, place the mappable BOs that Mesa asks for in VRAM in CPU-visible VRAM, which the evict and pressure tests then use")
 	fs.Parse(args)
-	if fs.NArg() != 0 || (*rom != "") != (*device != "") {
+	if fs.NArg() != 0 || (*rom != "") != (*device != "") || (*vram && *device == "") {
 		fs.Usage()
 		os.Exit(2)
 	}
@@ -177,7 +181,7 @@ Tests:`+gpuTestList())
 	}
 	requireRoot()
 
-	s := &gpuSuite{build: *build, mesa: *mesa, stopped: map[*harness.Guest]bool{}}
+	s := &gpuSuite{build: *build, mesa: *mesa, vram: *vram, stopped: map[*harness.Guest]bool{}}
 	if *device != "" {
 		r, err := filepath.Abs(*rom)
 		if err != nil {
@@ -358,6 +362,9 @@ func (s *gpuSuite) startMem(mem string) *harness.Guest {
 		Name:   gpuName,
 		LogDir: s.logDir,
 		Args:   []string{"mem=" + mem, "init_shell"},
+	}
+	if s.vram {
+		l.Options = "vram"
 	}
 	if s.device != "" {
 		l.Devices = []string{s.device}
@@ -925,7 +932,12 @@ func gpuTestMesa(s *gpuSuite) {
 // runMesa runs a program with the Mesa prefix and saves its output in the
 // test's directory.
 func (s *gpuSuite) runMesa(log string, name string, args ...string) string {
-	ctx, cancel := context.WithTimeout(s.ctx, 2*time.Minute)
+	return s.runMesaFor(2*time.Minute, log, name, args...)
+}
+
+// runMesaFor runs a program as runMesa does, for at most timeout.
+func (s *gpuSuite) runMesaFor(timeout time.Duration, log string, name string, args ...string) string {
+	ctx, cancel := context.WithTimeout(s.ctx, timeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, name, args...)
 	cmd.Env = s.mesaEnv()
@@ -1071,8 +1083,9 @@ func gpuTestShare(s *gpuSuite) {
 }
 
 // gpuTestEvict runs testprogs/vk-evict, whose host-visible buffer the guest
-// evicts from GTT before each of its rounds. An eviction unmaps the buffer
-// from the region, and the program's next access faults and maps it again.
+// evicts from GTT, or with -vram from VRAM, before each of its rounds. An
+// eviction unmaps the buffer from the region, and the program's next access
+// faults and maps it again.
 func gpuTestEvict(s *gpuSuite) {
 	const rounds = 2
 	if s.device == "" {
@@ -1102,7 +1115,11 @@ func gpuTestEvict(s *gpuSuite) {
 	defer log.Close()
 	ctx, cancel := context.WithTimeout(s.ctx, 2*time.Minute)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, prog, node)
+	args := []string{node}
+	if s.vram {
+		args = append(args, "vram")
+	}
+	cmd := exec.CommandContext(ctx, prog, args...)
 	cmd.Env = s.mesaEnv()
 	cmd.Stderr = log
 	stdin, err := cmd.StdinPipe()
@@ -1144,9 +1161,9 @@ func gpuTestEvict(s *gpuSuite) {
 	s.counters(g)
 }
 
-// evictRounds evicts the guest's GTT before each round of vk-evict, and
-// checks that the eviction unmaps the program's buffer and that the round
-// maps it again through faults.
+// evictRounds evicts the guest's GTT or VRAM before each round of vk-evict,
+// and checks that the eviction unmaps the program's buffer and that the
+// round maps it again through faults.
 func (s *gpuSuite) evictRounds(ctx context.Context, g *harness.Guest, rounds int,
 	stdin io.Writer, lines <-chan string) {
 	// next waits for the program's next line that holds text, and reports
@@ -1172,10 +1189,10 @@ func (s *gpuSuite) evictRounds(ctx context.Context, g *harness.Guest, rounds int
 			return
 		}
 		before := g.Counters()
-		out := g.Output("cat /sys/kernel/debug/dri/*/amdgpu_evict_gtt", 30*time.Second)
+		out := g.Output("cat /sys/kernel/debug/dri/*/amdgpu_evict_"+s.memory(), 30*time.Second)
 		fields := strings.Fields(out)
 		s.Check(len(fields) > 0 && strings.Trim(strings.Join(fields, ""), "0") == "",
-			"the guest evicts its GTT, %q", strings.TrimSpace(out))
+			"the guest evicts its %s, %q", s.memory(), strings.TrimSpace(out))
 		evicted := g.Counters()
 		s.Check(evicted["moves"] > before["moves"],
 			"the eviction unmaps the buffer, %d moves", evicted["moves"]-before["moves"])
@@ -1198,8 +1215,9 @@ func (s *gpuSuite) evictRounds(ctx context.Context, g *harness.Guest, rounds int
 
 // gpuTestPressure runs testprogs/vk-pressure in a guest with 1G of memory,
 // whose GTT and TTM page limit are half of it. The program's buffers exceed
-// both, so the guest's TTM evicts and swaps out buffers that the host maps,
-// and the host's accesses map them again through faults.
+// both, or with -vram, the CPU-visible VRAM, so the guest's TTM evicts and
+// swaps out buffers that the host maps, and the host's accesses map them
+// again through faults.
 func gpuTestPressure(s *gpuSuite) {
 	if s.device == "" {
 		fmt.Println("the pressure test needs -device, so it is skipped")
@@ -1223,18 +1241,33 @@ func gpuTestPressure(s *gpuSuite) {
 	}
 
 	// RADV reports part of GTT as device-local memory on an APU, so the
-	// guest's own GTT size sets how much the program allocates.
-	gtt := strings.Fields(g.Output("cat /sys/class/drm/card*/device/mem_info_gtt_total", 10*time.Second))
-	size := int64(0)
-	if len(gtt) > 0 {
-		size, _ = strconv.ParseInt(gtt[0], 10, 64)
+	// guest's own size of the memory sets how much the program allocates.
+	file := "mem_info_gtt_total"
+	if s.vram {
+		file = "mem_info_vis_vram_total"
 	}
-	if !s.Check(size > 0, "the guest reports its GTT size, %d MiB", size>>20) {
+	total := strings.Fields(g.Output("cat /sys/class/drm/card*/device/"+file, 10*time.Second))
+	size := int64(0)
+	if len(total) > 0 {
+		size, _ = strconv.ParseInt(total[0], 10, 64)
+	}
+	if !s.Check(size > 0, "the guest reports the size of its %s, %d MiB", s.memory(), size>>20) {
+		return
+	}
+	// The buffers beyond visible VRAM are evicted to the guest's 1G of
+	// memory, which holds them only while visible VRAM is small.
+	if s.vram && size > 512<<20 {
+		fmt.Printf("visible VRAM of %d MiB is too large for the pressure test, so it is skipped\n", size>>20)
 		return
 	}
 
+	args := []string{node, strconv.FormatInt(size, 10)}
+	if s.vram {
+		args = append(args, "vram")
+	}
 	before := g.Counters()
-	out := s.runMesa("pressure.log", prog, node, strconv.FormatInt(size, 10))
+	// The host maps VRAM uncached, which makes the program's passes slow.
+	out := s.runMesaFor(10*time.Minute, "pressure.log", prog, args...)
 	s.Check(strings.Contains(out, "the GPU's fill and the last pattern are in buffer 0"),
 		"every buffer keeps its contents, see pressure.log")
 	after := g.Counters()
@@ -1250,4 +1283,13 @@ func gpuTestPressure(s *gpuSuite) {
 	}, 10*time.Second, 200*time.Millisecond)
 	s.Check(ok, "the guest frees the buffers' resources once the program exits")
 	s.counters(g)
+}
+
+// memory returns the memory that the evict and pressure tests use, as
+// amdgpu's debugfs names it.
+func (s *gpuSuite) memory() string {
+	if s.vram {
+		return "vram"
+	}
+	return "gtt"
 }
