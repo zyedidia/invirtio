@@ -25,13 +25,13 @@ struct gpu {
 	VkCommandPool pool;
 };
 
-static void die(const char *msg, VkResult r)
+static inline void die(const char *msg, VkResult r)
 {
 	fprintf(stderr, "%s: %s: %s failed: %d\n", prog, role, msg, r);
 	exit(1);
 }
 
-static void check(VkResult r, const char *msg)
+static inline void check(VkResult r, const char *msg)
 {
 	if (r != VK_SUCCESS)
 		die(msg, r);
@@ -41,8 +41,8 @@ static void check(VkResult r, const char *msg)
  * Create a device on the Vulkan device of a DRM render node, with the
  * device extensions in exts.
  */
-static void gpu_init(struct gpu *g, const char *node,
-		     const char *const *exts, uint32_t nexts)
+static inline void gpu_init(struct gpu *g, const char *node,
+			    const char *const *exts, uint32_t nexts)
 {
 	VkApplicationInfo app = {
 		.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
@@ -136,7 +136,7 @@ static inline VkMemoryPropertyFlags host_visible_flags(int vram)
 			       VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
 }
 
-static void gpu_destroy(struct gpu *g)
+static inline void gpu_destroy(struct gpu *g)
 {
 	vkDestroyCommandPool(g->dev, g->pool, NULL);
 	vkDestroyDevice(g->dev, NULL);
@@ -147,8 +147,8 @@ static void gpu_destroy(struct gpu *g)
  * Return a memory type among bits that has the flags, or, unless they are
  * required, any type among bits.
  */
-static uint32_t memory_type(struct gpu *g, uint32_t bits,
-			    VkMemoryPropertyFlags flags, int required)
+static inline uint32_t memory_type(struct gpu *g, uint32_t bits,
+				   VkMemoryPropertyFlags flags, int required)
 {
 	VkPhysicalDeviceMemoryProperties mp;
 	uint32_t i;
@@ -170,8 +170,8 @@ static uint32_t memory_type(struct gpu *g, uint32_t bits,
 }
 
 /* Record commands with record, submit them and wait for them. */
-static void run(struct gpu *g, void (*record)(VkCommandBuffer, void *),
-		void *arg)
+static inline void run(struct gpu *g,
+		       void (*record)(VkCommandBuffer, void *), void *arg)
 {
 	VkCommandBufferAllocateInfo cai = {
 		.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
@@ -210,10 +210,10 @@ static void run(struct gpu *g, void (*record)(VkCommandBuffer, void *),
  * A barrier on a whole buffer, which also transfers it between queue
  * families when they differ.
  */
-static void barrier(VkCommandBuffer cmd, VkBuffer b,
-		    VkPipelineStageFlags src_stage, VkAccessFlags src,
-		    VkPipelineStageFlags dst_stage, VkAccessFlags dst,
-		    uint32_t src_family, uint32_t dst_family)
+static inline void barrier(VkCommandBuffer cmd, VkBuffer b,
+			   VkPipelineStageFlags src_stage, VkAccessFlags src,
+			   VkPipelineStageFlags dst_stage, VkAccessFlags dst,
+			   uint32_t src_family, uint32_t dst_family)
 {
 	VkBufferMemoryBarrier bmb = {
 		.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
