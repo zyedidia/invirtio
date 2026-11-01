@@ -135,7 +135,8 @@ static void usage(void)
 "                pass through this PCI device, such as 0000:06:00.0. With\n"
 "                rom, the guest sees the image in <file> as the device's\n"
 "                expansion ROM. Can be repeated\n"
-"  -b            bind the devices to vfio-pci if they are not bound to it\n"
+"  -b            bind the devices to vfio-pci if they are not bound to it,\n"
+"                and bind a display controller again to keep it in D0\n"
 "  -e <type>,<name>,log=<file>\n"
 "                let the guest export the VDUSE device <name> of type blk,\n"
 "                net, wlan or gpu, with its in-flight log in <file>. The\n"
@@ -379,32 +380,92 @@ static bool valid_address(const char *addr)
 	return addr[11] >= '0' && addr[11] <= '7';
 }
 
+static bool is_display(const char *addr)
+{
+	char path[PATH_MAX], class[16] = "";
+
+	snprintf(path, sizeof(path), "/sys/bus/pci/devices/%s/class", addr);
+	return read_file(path, class, sizeof(class)) >= 0 &&
+	       !strncmp(class, "0x03", 4);
+}
+
+#define D3_PARAM "/sys/module/vfio_pci/parameters/disable_idle_d3"
+
+/*
+ * An APU's GPU loses the state that its firmware set up at boot when it
+ * enters D3, which vfio-pci puts an idle device in. vfio-pci latches
+ * disable_idle_d3 for each device that it binds, so the parameter is set
+ * while a display controller is bound. It is locked with flock while it is
+ * set, so that two binders do not restore each other's value. Return the
+ * locked fd and the value to restore.
+ */
+static int keep_d0(char *old, size_t len)
+{
+	int fd;
+
+	fd = open(D3_PARAM, O_RDONLY | O_CLOEXEC);
+	if (fd < 0 || flock(fd, LOCK_EX) < 0)
+		die("cannot lock %s, is vfio-pci loaded? %s", D3_PARAM,
+		    strerror(errno));
+	if (read_file(D3_PARAM, old, len) < 0 || write_file(D3_PARAM, "Y"))
+		die("cannot set %s", D3_PARAM);
+	return fd;
+}
+
+static void restore_d3(int fd, const char *old)
+{
+	if (write_file(D3_PARAM, old))
+		warn("cannot restore %s to %s", D3_PARAM, old);
+	close(fd);
+}
+
 /*
  * Bind the device to vfio-pci. driver_override is set first, so that the
- * device cannot go back to its own driver once it is unbound.
+ * device cannot go back to its own driver once it is unbound. For a display
+ * controller, disable_idle_d3 is set before the device is changed, and stop
+ * signals wait until it is restored.
  */
 static void bind_to_vfio(const char *addr, const char *driver)
 {
-	char path[PATH_MAX], now[64];
-	int err;
+	char path[PATH_MAX], now[64], old[8] = "";
+	bool display = is_display(addr);
+	sigset_t stop, saved;
+	int err, d3_fd = -1;
+
+	sigemptyset(&stop);
+	sigaddset(&stop, SIGINT);
+	sigaddset(&stop, SIGTERM);
+	sigaddset(&stop, SIGHUP);
+	sigprocmask(SIG_BLOCK, &stop, &saved);
+	if (display)
+		d3_fd = keep_d0(old, sizeof(old));
 
 	snprintf(path, sizeof(path), "/sys/bus/pci/devices/%s/driver_override",
 		 addr);
 	err = write_file(path, "vfio-pci");
-	if (err)
+	if (err) {
+		if (display)
+			restore_d3(d3_fd, old);
 		die("cannot set the driver override of %s: %s", addr,
 		    strerror(-err));
+	}
 
 	if (driver[0]) {
 		snprintf(path, sizeof(path),
 			 "/sys/bus/pci/devices/%s/driver/unbind", addr);
 		err = write_file(path, addr);
-		if (err)
+		if (err) {
+			if (display)
+				restore_d3(d3_fd, old);
 			die("cannot unbind %s from %s: %s", addr, driver,
 			    strerror(-err));
+		}
 	}
 
 	write_file("/sys/bus/pci/drivers_probe", addr);
+	if (display)
+		restore_d3(d3_fd, old);
+	sigprocmask(SIG_SETMASK, &saved, NULL);
 	device_driver(addr, now, sizeof(now));
 	if (strcmp(now, "vfio-pci"))
 		die("binding %s to vfio-pci failed, its driver is '%s'", addr,
@@ -412,10 +473,20 @@ static void bind_to_vfio(const char *addr, const char *driver)
 	warn("bound %s to vfio-pci", addr);
 }
 
-/* Check the device's driver and find its IOMMU group. */
+/*
+ * Check the device's driver and find its IOMMU group. With -b, a display
+ * controller that is already on vfio-pci is bound again, since it may have
+ * latched the default disable_idle_d3. The rebind holds the device's VFIO
+ * group, which one process can open at a time, so that no other process
+ * opens it meanwhile. It fails if another process holds the group, which it
+ * does while it has the device open, and the unbind would wait for that. A device that has already
+ * left D0 may have lost its firmware state, which the rebind cannot bring
+ * back.
+ */
 static void setup_device(struct device *dev)
 {
 	char path[PATH_MAX], link[PATH_MAX], driver[64];
+	bool rebind = false;
 	ssize_t n;
 	char *base, *end;
 
@@ -428,6 +499,8 @@ static void setup_device(struct device *dev)
 			die("%s is bound to '%s', not vfio-pci. Use -b to bind it",
 			    dev->addr, driver);
 		bind_to_vfio(dev->addr, driver);
+	} else {
+		rebind = bind_devices && is_display(dev->addr);
 	}
 
 	snprintf(path, sizeof(path), "/sys/bus/pci/devices/%s/iommu_group",
@@ -441,6 +514,25 @@ static void setup_device(struct device *dev)
 	dev->group_id = strtol(base, &end, 10);
 	if (*end || end == base)
 		die("cannot parse the IOMMU group of %s", dev->addr);
+
+	if (rebind) {
+		char state[16] = "";
+		int fd;
+
+		snprintf(path, sizeof(path), "/dev/vfio/%d", dev->group_id);
+		fd = open(path, O_RDWR | O_CLOEXEC);
+		if (fd < 0)
+			die("cannot bind %s again to keep it in D0, cannot open %s: %s",
+			    dev->addr, path, strerror(errno));
+		snprintf(path, sizeof(path),
+			 "/sys/bus/pci/devices/%s/power_state", dev->addr);
+		if (read_file(path, state, sizeof(state)) == 0 &&
+		    strcmp(state, "D0"))
+			warn("%s is in %s, so it may have lost the state that its firmware set up at boot",
+			     dev->addr, state);
+		bind_to_vfio(dev->addr, driver);
+		close(fd);
+	}
 }
 
 /*
