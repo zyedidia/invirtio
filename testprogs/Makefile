@@ -1,10 +1,13 @@
 OUT ?= ../build
 CFLAGS ?= -O2 -Wall -Wextra
+PROGS = $(OUT)/vk-dmabuf-share $(OUT)/vk-evict
 
-$(OUT)/vk-dmabuf-share: vk-dmabuf-share.c
+all: $(PROGS)
+
+$(OUT)/%: %.c vkutil.h
 	mkdir -p $(OUT)
 	$(CC) $(CFLAGS) -o $@ $< -lvulkan
 
-.PHONY: clean
+.PHONY: all clean
 clean:
-	rm -f $(OUT)/vk-dmabuf-share
+	rm -f $(PROGS)

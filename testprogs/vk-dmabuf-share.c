@@ -10,156 +10,21 @@
  *
  * usage: vk-dmabuf-share <render node>
  */
-#include <errno.h>
 #include <fcntl.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
-#include <sys/sysmacros.h>
 #include <sys/wait.h>
 #include <unistd.h>
-#include <vulkan/vulkan.h>
+
+#include "vkutil.h"
 
 #define SIZE (1 << 20)
 #define PATTERN 0x5a5a1234u
 
-static const char *prog = "vk-dmabuf-share";
-static const char *role = "exporter";
-static const char *node;
-
-struct gpu {
-	VkInstance instance;
-	VkPhysicalDevice phys;
-	VkDevice dev;
-	VkQueue queue;
-	uint32_t family;
-	VkCommandPool pool;
+static const char *const exts[] = {
+	VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,
+	VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME,
 };
-
-static void die(const char *msg, VkResult r)
-{
-	fprintf(stderr, "%s: %s: %s failed: %d\n", prog, role, msg, r);
-	exit(1);
-}
-
-static void check(VkResult r, const char *msg)
-{
-	if (r != VK_SUCCESS)
-		die(msg, r);
-}
-
-static void gpu_init(struct gpu *g)
-{
-	static const char *const exts[] = {
-		VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,
-		VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME,
-	};
-	VkApplicationInfo app = {
-		.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
-		.pApplicationName = prog,
-		.apiVersion = VK_API_VERSION_1_1,
-	};
-	VkInstanceCreateInfo ici = {
-		.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
-		.pApplicationInfo = &app,
-	};
-	VkPhysicalDeviceDrmPropertiesEXT drm = {
-		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRM_PROPERTIES_EXT,
-	};
-	VkPhysicalDeviceProperties2 props = {
-		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
-		.pNext = &drm,
-	};
-	VkPhysicalDevice devs[16];
-	VkQueueFamilyProperties families[16];
-	uint32_t n = 16, nfam = 16, i;
-	float prio = 1.0f;
-	struct stat st;
-
-	if (stat(node, &st) < 0 || !S_ISCHR(st.st_mode)) {
-		fprintf(stderr, "%s: %s: %s is not a device node\n", prog, role,
-			node);
-		exit(1);
-	}
-	check(vkCreateInstance(&ici, NULL, &g->instance), "vkCreateInstance");
-	vkEnumeratePhysicalDevices(g->instance, &n, devs);
-	g->phys = VK_NULL_HANDLE;
-	for (i = 0; i < n && !g->phys; i++) {
-		drm.hasRender = VK_FALSE;
-		vkGetPhysicalDeviceProperties2(devs[i], &props);
-		if (drm.hasRender && drm.renderMajor == major(st.st_rdev) &&
-		    drm.renderMinor == minor(st.st_rdev))
-			g->phys = devs[i];
-	}
-	if (!g->phys) {
-		fprintf(stderr, "%s: %s: no Vulkan device has the render node %s\n",
-			prog, role, node);
-		exit(1);
-	}
-	printf("%s: %s: %s on %s\n", prog, role, props.properties.deviceName,
-	       node);
-
-	vkGetPhysicalDeviceQueueFamilyProperties(g->phys, &nfam, families);
-	for (i = 0; i < nfam; i++) {
-		if (families[i].queueFlags &
-		    (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT))
-			break;
-	}
-	if (i == nfam)
-		die("finding a queue", VK_ERROR_INITIALIZATION_FAILED);
-	g->family = i;
-
-	VkDeviceQueueCreateInfo qci = {
-		.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
-		.queueFamilyIndex = g->family,
-		.queueCount = 1,
-		.pQueuePriorities = &prio,
-	};
-	VkDeviceCreateInfo dci = {
-		.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
-		.queueCreateInfoCount = 1,
-		.pQueueCreateInfos = &qci,
-		.enabledExtensionCount = sizeof(exts) / sizeof(exts[0]),
-		.ppEnabledExtensionNames = exts,
-	};
-	check(vkCreateDevice(g->phys, &dci, NULL, &g->dev), "vkCreateDevice");
-	vkGetDeviceQueue(g->dev, g->family, 0, &g->queue);
-
-	VkCommandPoolCreateInfo pci = {
-		.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
-		.queueFamilyIndex = g->family,
-	};
-	check(vkCreateCommandPool(g->dev, &pci, NULL, &g->pool),
-	      "vkCreateCommandPool");
-}
-
-/*
- * Return a memory type among bits that has the flags, or, unless they are
- * required, any type among bits.
- */
-static uint32_t memory_type(struct gpu *g, uint32_t bits,
-			    VkMemoryPropertyFlags flags, int required)
-{
-	VkPhysicalDeviceMemoryProperties mp;
-	uint32_t i;
-
-	vkGetPhysicalDeviceMemoryProperties(g->phys, &mp);
-	for (i = 0; i < mp.memoryTypeCount; i++) {
-		if ((bits & (1u << i)) &&
-		    (mp.memoryTypes[i].propertyFlags & flags) == flags)
-			return i;
-	}
-	if (required)
-		die("finding a memory type", VK_ERROR_FEATURE_NOT_PRESENT);
-	for (i = 0; i < mp.memoryTypeCount; i++) {
-		if (bits & (1u << i))
-			return i;
-	}
-	die("finding a memory type", VK_ERROR_FEATURE_NOT_PRESENT);
-	return 0;
-}
+static const char *node;
 
 static VkBuffer buffer(struct gpu *g, VkBufferUsageFlags usage, int external)
 {
@@ -178,66 +43,6 @@ static VkBuffer buffer(struct gpu *g, VkBufferUsageFlags usage, int external)
 
 	check(vkCreateBuffer(g->dev, &bci, NULL, &b), "vkCreateBuffer");
 	return b;
-}
-
-/* Record commands with record, submit them and wait for them. */
-static void run(struct gpu *g, void (*record)(VkCommandBuffer, void *),
-		void *arg)
-{
-	VkCommandBufferAllocateInfo cai = {
-		.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
-		.commandPool = g->pool,
-		.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
-		.commandBufferCount = 1,
-	};
-	VkCommandBufferBeginInfo begin = {
-		.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
-		.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
-	};
-	VkFenceCreateInfo fci = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
-	VkCommandBuffer cmd;
-	VkFence fence;
-
-	check(vkAllocateCommandBuffers(g->dev, &cai, &cmd),
-	      "vkAllocateCommandBuffers");
-	check(vkBeginCommandBuffer(cmd, &begin), "vkBeginCommandBuffer");
-	record(cmd, arg);
-	check(vkEndCommandBuffer(cmd), "vkEndCommandBuffer");
-
-	VkSubmitInfo si = {
-		.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-		.commandBufferCount = 1,
-		.pCommandBuffers = &cmd,
-	};
-	check(vkCreateFence(g->dev, &fci, NULL, &fence), "vkCreateFence");
-	check(vkQueueSubmit(g->queue, 1, &si, fence), "vkQueueSubmit");
-	check(vkWaitForFences(g->dev, 1, &fence, VK_TRUE, 10ull * 1000000000),
-	      "vkWaitForFences");
-	vkDestroyFence(g->dev, fence, NULL);
-	vkFreeCommandBuffers(g->dev, g->pool, 1, &cmd);
-}
-
-/*
- * A barrier on a whole buffer, which also transfers it between queue
- * families when they differ.
- */
-static void barrier(VkCommandBuffer cmd, VkBuffer b,
-		    VkPipelineStageFlags src_stage, VkAccessFlags src,
-		    VkPipelineStageFlags dst_stage, VkAccessFlags dst,
-		    uint32_t src_family, uint32_t dst_family)
-{
-	VkBufferMemoryBarrier bmb = {
-		.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
-		.srcAccessMask = src,
-		.dstAccessMask = dst,
-		.srcQueueFamilyIndex = src_family,
-		.dstQueueFamilyIndex = dst_family,
-		.buffer = b,
-		.size = VK_WHOLE_SIZE,
-	};
-
-	vkCmdPipelineBarrier(cmd, src_stage, dst_stage, 0, 0, NULL, 1, &bmb,
-			     0, NULL);
 }
 
 /* The arguments of the recorded commands. */
@@ -294,7 +99,7 @@ static int import(int fd)
 	size_t i, bad = 0;
 
 	role = "importer";
-	gpu_init(&g);
+	gpu_init(&g, node, exts, sizeof(exts) / sizeof(exts[0]));
 	get_props = (PFN_vkGetMemoryFdPropertiesKHR)vkGetDeviceProcAddr(
 		g.dev, "vkGetMemoryFdPropertiesKHR");
 	if (!get_props)
@@ -354,9 +159,7 @@ static int import(int fd)
 	vkDestroyBuffer(g.dev, b[1], NULL);
 	vkFreeMemory(g.dev, src_mem, NULL);
 	vkFreeMemory(g.dev, dst_mem, NULL);
-	vkDestroyCommandPool(g.dev, g.pool, NULL);
-	vkDestroyDevice(g.dev, NULL);
-	vkDestroyInstance(g.instance, NULL);
+	gpu_destroy(&g);
 
 	if (bad) {
 		printf("%s: importer: %zu of %zu words differ from the pattern\n",
@@ -382,7 +185,7 @@ static int export(const char *self)
 	int fd, status;
 	pid_t pid;
 
-	gpu_init(&g);
+	gpu_init(&g, node, exts, sizeof(exts) / sizeof(exts[0]));
 	b = buffer(&g, VK_BUFFER_USAGE_TRANSFER_DST_BIT |
 		       VK_BUFFER_USAGE_TRANSFER_SRC_BIT, 1);
 	vkGetBufferMemoryRequirements(g.dev, b, &req);
@@ -446,9 +249,7 @@ static int export(const char *self)
 
 	vkDestroyBuffer(g.dev, b, NULL);
 	vkFreeMemory(g.dev, mem, NULL);
-	vkDestroyCommandPool(g.dev, g.pool, NULL);
-	vkDestroyDevice(g.dev, NULL);
-	vkDestroyInstance(g.instance, NULL);
+	gpu_destroy(&g);
 	return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
 }
 
@@ -456,6 +257,8 @@ int main(int argc, char **argv)
 {
 	/* Both processes write to one pipe, in the order they run. */
 	setvbuf(stdout, NULL, _IOLBF, 0);
+	prog = "vk-dmabuf-share";
+	role = "exporter";
 	if (argc == 4 && !strcmp(argv[2], "--import")) {
 		node = argv[1];
 		return import(atoi(argv[3]));
