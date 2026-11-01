@@ -1,6 +1,6 @@
 OUT ?= ../build
 CFLAGS ?= -O2 -Wall -Wextra
-PROGS = $(OUT)/vk-dmabuf-share $(OUT)/vk-evict
+PROGS = $(OUT)/vk-dmabuf-share $(OUT)/vk-evict $(OUT)/vk-pressure
 
 all: $(PROGS)
 
