@@ -108,6 +108,7 @@ var gpuTests = []gpuTest{
 	{"share", "with -device, two processes share a buffer through a dma-buf and use it on the GPU", gpuTestShare},
 	{"evict", "with -device, a host-visible buffer keeps its contents across evictions from GTT, or with -vram from VRAM, in the guest", gpuTestEvict},
 	{"pressure", "with -device, host-visible buffers that exceed GTT, or with -vram visible VRAM, keep their contents while the guest evicts them on its own", gpuTestPressure},
+	{"bandwidth", "with -device, measures the CPU's bandwidth to a host-visible buffer in GTT, or with -vram in visible VRAM", gpuTestBandwidth},
 	{"deqp", "with -device, dEQP's synchronization and external memory tests pass through native context", gpuTestDeqp},
 }
 
@@ -169,7 +170,7 @@ Tests:`+gpuTestList())
 	rom := fs.String("rom", "", "the VBIOS image of the iGPU")
 	mesa := fs.String("mesa", filepath.Join(root, "build/mesa"), "the prefix of the Mesa that scripts/mesa-build.sh built")
 	runRE := fs.String("run", "", "run only the tests whose names match this regular expression")
-	vram := fs.Bool("vram", false, "with -device, place the mappable BOs that Mesa asks for in VRAM in CPU-visible VRAM, which the evict and pressure tests then use")
+	vram := fs.Bool("vram", false, "with -device, place the mappable BOs that Mesa asks for in VRAM in CPU-visible VRAM, which the evict, pressure and bandwidth tests then use, and have vfio-pci map VRAM write-combined")
 	fs.Parse(args)
 	if fs.NArg() != 0 || (*rom != "") != (*device != "") || (*vram && *device == "") {
 		fs.Usage()
@@ -196,6 +197,13 @@ Tests:`+gpuTestList())
 		return err
 	}
 	defer os.RemoveAll(s.logDir)
+	restore := func() {}
+	if s.vram {
+		if restore, err = prefetchableWC(); err != nil {
+			return err
+		}
+		defer restore()
+	}
 
 	// A signal fails the test that runs, and no other test runs. A second
 	// signal kills the guests and exits.
@@ -218,6 +226,7 @@ Tests:`+gpuTestList())
 		}
 		s.mu.Unlock()
 		fmt.Printf("the device %s stays attached, remove it with vdpa dev del once no process uses it\n", gpuName)
+		restore()
 		os.RemoveAll(s.logDir)
 		harness.CloseOutput()
 		os.Exit(1)
@@ -1292,4 +1301,69 @@ func (s *gpuSuite) memory() string {
 		return "vram"
 	}
 	return "gtt"
+}
+
+var bandwidthRE = regexp.MustCompile(`(?m)^vk-bandwidth: main: (\w+ \w+) (\d+) MiB/s$`)
+
+// gpuTestBandwidth runs testprogs/vk-bandwidth on the memory that the evict
+// and pressure tests use, and prints how fast the CPU writes, reads and
+// copies into it. It checks only that the program measures all three.
+func gpuTestBandwidth(s *gpuSuite) {
+	if s.device == "" {
+		fmt.Println("the bandwidth test needs -device, so it is skipped")
+		return
+	}
+	prog := filepath.Join(harness.RepoRoot(), "build/vk-bandwidth")
+	if !s.Check(harness.Exists(prog), "%s is built, with make -C testprogs", prog) {
+		return
+	}
+	if !s.Check(harness.Exists(filepath.Join(s.mesa, "lib/libvulkan_radeon.so")),
+		"the Mesa prefix %s is built", s.mesa) {
+		return
+	}
+	g := s.start()
+	if g == nil {
+		return
+	}
+	node := s.attach()
+	if node == "" {
+		return
+	}
+
+	args := []string{node}
+	if s.vram {
+		args = append(args, "vram")
+	}
+	// Uncached reads of VRAM are slow.
+	out := s.runMesaFor(10*time.Minute, "bandwidth.log", prog, args...)
+	m := bandwidthRE.FindAllStringSubmatch(out, -1)
+	for _, r := range m {
+		fmt.Printf("bandwidth: %s %s MiB/s\n", r[1], r[2])
+	}
+	s.Check(len(m) == 3, "vk-bandwidth measures writes, reads and copies, see bandwidth.log")
+	s.counters(g)
+}
+
+// prefetchableWCParam makes vfio-pci map prefetchable BARs, BAR0 among them,
+// write-combined when a guest opens the device.
+const prefetchableWCParam = "/sys/module/vfio_pci_core/parameters/prefetchable_wc"
+
+// prefetchableWC sets vfio-pci's prefetchable_wc, so that the host maps
+// VRAM write-combined, and returns a function that restores it.
+func prefetchableWC() (func(), error) {
+	if err := harness.Modprobe("vfio-pci"); err != nil {
+		return nil, err
+	}
+	old := harness.Read(prefetchableWCParam)
+	if old == "" {
+		return nil, fmt.Errorf("%s is missing, so the host kernel lacks write-combining for vfio-pci", prefetchableWCParam)
+	}
+	if err := harness.Write(prefetchableWCParam, "Y"); err != nil {
+		return nil, err
+	}
+	return func() {
+		if err := harness.Write(prefetchableWCParam, old); err != nil {
+			fmt.Printf("warning: cannot restore %s to %s: %v\n", prefetchableWCParam, old, err)
+		}
+	}, nil
 }
