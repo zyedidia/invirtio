@@ -107,6 +107,7 @@ var gpuTests = []gpuTest{
 	{"render", "with -device, vkmark renders headless through RADV and native context", gpuTestRender},
 	{"share", "with -device, two processes share a buffer through a dma-buf and use it on the GPU", gpuTestShare},
 	{"evict", "with -device, a host-visible buffer keeps its contents across evictions from GTT in the guest", gpuTestEvict},
+	{"pressure", "with -device, host-visible buffers that exceed GTT keep their contents while the guest evicts them on its own", gpuTestPressure},
 	{"deqp", "with -device, dEQP's synchronization and external memory tests pass through native context", gpuTestDeqp},
 }
 
@@ -339,9 +340,14 @@ func (s *gpuSuite) stop(g *harness.Guest) {
 	}
 }
 
-// start starts a guest under the launcher and waits until it has created
-// the device and its shell answers.
+// start starts a guest with 2G of memory under the launcher and waits until
+// it has created the device and its shell answers.
 func (s *gpuSuite) start() *harness.Guest {
+	return s.startMem("2G")
+}
+
+// startMem starts a guest as start does, with mem as its memory size.
+func (s *gpuSuite) startMem(mem string) *harness.Guest {
 	n := len(s.guests) + 1
 	if s.ctx.Err() != nil {
 		return nil
@@ -351,7 +357,7 @@ func (s *gpuSuite) start() *harness.Guest {
 		Type:   "gpu",
 		Name:   gpuName,
 		LogDir: s.logDir,
-		Args:   []string{"mem=2G", "init_shell"},
+		Args:   []string{"mem=" + mem, "init_shell"},
 	}
 	if s.device != "" {
 		l.Devices = []string{s.device}
@@ -1188,4 +1194,60 @@ func (s *gpuSuite) evictRounds(ctx context.Context, g *harness.Guest, rounds int
 			"the round's accesses map the buffer again through faults, %d faults",
 			after["faults"]-evicted["faults"])
 	}
+}
+
+// gpuTestPressure runs testprogs/vk-pressure in a guest with 1G of memory,
+// whose GTT and TTM page limit are half of it. The program's buffers exceed
+// both, so the guest's TTM evicts and swaps out buffers that the host maps,
+// and the host's accesses map them again through faults.
+func gpuTestPressure(s *gpuSuite) {
+	if s.device == "" {
+		fmt.Println("the pressure test needs -device, so it is skipped")
+		return
+	}
+	prog := filepath.Join(harness.RepoRoot(), "build/vk-pressure")
+	if !s.Check(harness.Exists(prog), "%s is built, with make -C testprogs", prog) {
+		return
+	}
+	if !s.Check(harness.Exists(filepath.Join(s.mesa, "lib/libvulkan_radeon.so")),
+		"the Mesa prefix %s is built", s.mesa) {
+		return
+	}
+	g := s.startMem("1G")
+	if g == nil {
+		return
+	}
+	node := s.attach()
+	if node == "" {
+		return
+	}
+
+	// RADV reports part of GTT as device-local memory on an APU, so the
+	// guest's own GTT size sets how much the program allocates.
+	gtt := strings.Fields(g.Output("cat /sys/class/drm/card*/device/mem_info_gtt_total", 10*time.Second))
+	size := int64(0)
+	if len(gtt) > 0 {
+		size, _ = strconv.ParseInt(gtt[0], 10, 64)
+	}
+	if !s.Check(size > 0, "the guest reports its GTT size, %d MiB", size>>20) {
+		return
+	}
+
+	before := g.Counters()
+	out := s.runMesa("pressure.log", prog, node, strconv.FormatInt(size, 10))
+	s.Check(strings.Contains(out, "the GPU's fill and the last pattern are in buffer 0"),
+		"every buffer keeps its contents, see pressure.log")
+	after := g.Counters()
+	moves := after["moves"] - before["moves"]
+	faults := after["faults"] - before["faults"]
+	s.Check(moves > 0 && faults > 0,
+		"the guest unmaps buffers that move and maps them again through faults, %d moves and %d faults",
+		moves, faults)
+	s.Check(after["faults_refused"] == 0, "the guest refuses no fault, not %d", after["faults_refused"])
+	ok := harness.Wait(func() bool {
+		v, ok := g.Counters()["resources"]
+		return ok && v == 0
+	}, 10*time.Second, 200*time.Millisecond)
+	s.Check(ok, "the guest frees the buffers' resources once the program exits")
+	s.counters(g)
 }
