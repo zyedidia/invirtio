@@ -12,6 +12,7 @@ import (
 	"regexp"
 	"runtime"
 	"runtime/debug"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -100,6 +101,8 @@ var gpuTests = []gpuTest{
 	{"virgl", "the device refuses virgl resources and contexts, and keeps serving", gpuTestVirgl},
 	{"map", "the shared memory buffer maps through the DRM fd and a dma-buf, and the guest's exit revokes both", gpuTestMap},
 	{"mesa", "RADV from scripts/mesa-build.sh finds the render node", gpuTestMesa},
+	{"native", "with -device, RADV and radeonsi drive the iGPU through native context", gpuTestNative},
+	{"render", "with -device, vkmark renders headless through RADV and native context", gpuTestRender},
 }
 
 type gpuSuite struct {
@@ -124,6 +127,12 @@ type gpuSuite struct {
 	// a file is open breaks the host, so the device stays attached and no
 	// other test runs.
 	stuck bool
+	// stopped holds the guests that stop has stopped.
+	stopped map[*harness.Guest]bool
+	// gpuLost is set when a guest with the iGPU had to be killed. Its
+	// driver did not shut down, which leaves the iGPU unusable until the
+	// host reboots, so no other test runs.
+	gpuLost bool
 }
 
 func cmdTestGpu(args []string) error {
@@ -162,7 +171,7 @@ Tests:`+gpuTestList())
 	}
 	requireRoot()
 
-	s := &gpuSuite{build: *build, mesa: *mesa}
+	s := &gpuSuite{build: *build, mesa: *mesa, stopped: map[*harness.Guest]bool{}}
 	if *device != "" {
 		r, err := filepath.Abs(*rom)
 		if err != nil {
@@ -211,13 +220,22 @@ Tests:`+gpuTestList())
 		}
 		fmt.Printf("== %s: %s\n", t.name, t.about)
 		s.runTest(t)
+		if s.gpuLost {
+			return fmt.Errorf("a guest with the iGPU did not power off in order, so the iGPU is unusable until the host reboots, %d check(s) failed",
+				len(s.Failures()))
+		}
 		if s.stuck {
-			// The device stays attached, and the guests are no longer needed.
+			// The device stays attached, and the guests are no longer
+			// needed. They power off in order, which keeps an iGPU usable.
 			for _, g := range s.guests {
-				g.Kill()
+				s.stop(g)
 			}
-			return fmt.Errorf("a file of %s is still open, so the device stays attached without its guest, remove it with vdpa dev del once no process uses it, %d check(s) failed",
-				gpuName, len(s.Failures()))
+			lost := ""
+			if s.gpuLost {
+				lost = ", a guest with the iGPU did not power off in order, so the iGPU is unusable until the host reboots"
+			}
+			return fmt.Errorf("a file of %s is still open, so the device stays attached without its guest, remove it with vdpa dev del once no process uses it%s, %d check(s) failed",
+				gpuName, lost, len(s.Failures()))
 		}
 	}
 	if ctx.Err() != nil {
@@ -279,8 +297,7 @@ func (s *gpuSuite) runTest(t gpuTest) {
 
 	harness.Detach(gpuName, s.ctx.Err() != nil)
 	for _, g := range s.guests {
-		g.Stop(30 * time.Second)
-		g.Kill()
+		s.stop(g)
 	}
 	harness.Cleanup(gpuName)
 	var warnings []string
@@ -291,6 +308,30 @@ func (s *gpuSuite) runTest(t gpuTest) {
 		fmt.Println("warning: " + w)
 	}
 	s.Check(len(warnings) == 0, "%s: no guest logs a kernel warning", t.name)
+}
+
+// stop asks a guest to power off, and kills it if it does not, which leaves
+// the iGPU of a guest with one unusable. Each guest is stopped once.
+func (s *gpuSuite) stop(g *harness.Guest) {
+	if s.stopped[g] {
+		return
+	}
+	s.stopped[g] = true
+	// The launcher kills a guest that has not powered off within its own
+	// timeout, and exits with the guest's status, or 128 and the signal. A
+	// guest that powered off exited with status 0 and logged its power-off,
+	// whether it was stopped or exited by itself.
+	if g.Running() {
+		g.Signal(syscall.SIGTERM)
+		g.Wait(40 * time.Second)
+	}
+	g.Kill()
+	log := g.Log()
+	clean := g.ExitCode() == 0 && strings.Contains(log, "reboot: Power down") &&
+		!strings.Contains(log, "did not stop within")
+	if !s.Check(clean, "the guest powers off in order") && s.device != "" {
+		s.gpuLost = true
+	}
 }
 
 // start starts a guest under the launcher and waits until it has created
@@ -805,8 +846,10 @@ func gpuTestMap(s *gpuSuite) {
 	s.Check(ok, "the guest has the buffer's resource")
 	s.counters(g)
 
-	// The guest's exit closes its VDUSE fd, which revokes the region.
-	g.Kill()
+	// The guest's exit closes its VDUSE fd, which revokes the region. The
+	// guest powers off in order, since an iGPU whose driver did not shut
+	// down stays unusable for the next guest.
+	s.stop(g)
 	ok = harness.Wait(func() bool { return readFaults(drm) && readFaults(dmabuf) }, 30*time.Second, 200*time.Millisecond)
 	s.Check(ok, "after the guest exits, both mappings give SIGBUS")
 
@@ -860,5 +903,112 @@ func gpuTestMesa(s *gpuSuite) {
 	}
 	s.Check(strings.Contains(string(out), "radv: info: Found device '"+node+"'"),
 		"RADV finds %s, see vulkaninfo.log", node)
+	s.counters(g)
+}
+
+// runMesa runs a program with the Mesa prefix and saves its output in the
+// test's directory.
+func (s *gpuSuite) runMesa(log string, name string, args ...string) string {
+	ctx, cancel := context.WithTimeout(s.ctx, 2*time.Minute)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.Env = s.mesaEnv()
+	out, err := cmd.CombinedOutput()
+	os.WriteFile(filepath.Join(s.dir, log), out, 0644)
+	s.Check(err == nil, "%s runs%s, see %s", name, errSuffix(err), log)
+	return string(out)
+}
+
+// commands returns the number of commands that the guest's device has
+// served, or -1 if the guest does not report it.
+func (s *gpuSuite) commands(g *harness.Guest) int64 {
+	if v, ok := g.Counters()["commands"]; ok {
+		return v
+	}
+	return -1
+}
+
+// gpuTestNative checks that the host's Mesa drives the guest's iGPU through
+// native context, which needs a guest with the iGPU.
+func gpuTestNative(s *gpuSuite) {
+	if s.device == "" {
+		fmt.Println("the native test needs -device, so it is skipped")
+		return
+	}
+	if !s.Check(harness.Exists(filepath.Join(s.mesa, "lib/libvulkan_radeon.so")),
+		"the Mesa prefix %s is built", s.mesa) {
+		return
+	}
+	g := s.start()
+	if g == nil {
+		return
+	}
+	if s.attach() == "" {
+		return
+	}
+
+	// A GPU that the host drives itself would pass the checks of the output
+	// too, so the guest must also have served the programs' commands.
+	before := s.commands(g)
+	out := s.runMesa("vulkaninfo.log", "vulkaninfo", "--summary")
+	s.Check(strings.Contains(out, "DRIVER_ID_MESA_RADV") && strings.Contains(out, "AMD"),
+		"vulkaninfo lists the Radeon through RADV, see vulkaninfo.log")
+	after := s.commands(g)
+	s.Check(before >= 0 && after > before, "the guest serves vulkaninfo's commands")
+	out = s.runMesa("eglinfo.log", "eglinfo", "-B", "-p", "surfaceless")
+	s.Check(strings.Contains(out, "radeonsi"), "eglinfo reports radeonsi, see eglinfo.log")
+	s.Check(after >= 0 && s.commands(g) > after, "the guest serves eglinfo's commands")
+	s.counters(g)
+}
+
+var (
+	vkmarkSceneRE = regexp.MustCompile(`(?m)^\[(.+)\] (.*): FPS: (\d+) FrameTime: ([0-9.]+) ms$`)
+	vkmarkScoreRE = regexp.MustCompile(`(?m)^\s*vkmark Score: (\d+)\s*$`)
+)
+
+// gpuTestRender runs vkmark's default scenes headless on the guest's iGPU,
+// which submits command buffers, waits on fences and maps buffers.
+func gpuTestRender(s *gpuSuite) {
+	if s.device == "" {
+		fmt.Println("the render test needs -device, so it is skipped")
+		return
+	}
+	if !s.Check(harness.Exists(filepath.Join(s.mesa, "lib/libvulkan_radeon.so")),
+		"the Mesa prefix %s is built", s.mesa) {
+		return
+	}
+	g := s.start()
+	if g == nil {
+		return
+	}
+	if s.attach() == "" {
+		return
+	}
+
+	before := s.commands(g)
+	ctx, cancel := context.WithTimeout(s.ctx, 10*time.Minute)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "vkmark", "--winsys", "headless")
+	cmd.Env = s.mesaEnv()
+	out, err := cmd.CombinedOutput()
+	os.WriteFile(filepath.Join(s.dir, "vkmark.log"), out, 0644)
+	log := string(out)
+	s.Check(err == nil, "vkmark finishes%s, see vkmark.log", errSuffix(err))
+	s.Check(strings.Contains(log, "RADV"), "vkmark uses RADV")
+	s.Check(!strings.Contains(log, "DEVICE_LOST"), "the device is never lost")
+
+	for _, m := range vkmarkSceneRE.FindAllStringSubmatch(log, -1) {
+		fmt.Printf("vkmark: %-10s %s: %s FPS, %s ms\n", m[1], m[2], m[3], m[4])
+	}
+	m := vkmarkScoreRE.FindStringSubmatch(log)
+	score := 0
+	if m != nil {
+		score, _ = strconv.Atoi(m[1])
+	}
+	s.Check(score > 0, "vkmark reports a score, %d", score)
+	// Each frame is at least one submission, so a GPU that the host drives
+	// itself would leave the guest's count nearly unchanged.
+	served := s.commands(g) - before
+	s.Check(before >= 0 && served > 1000, "the guest serves vkmark's commands, %d", served)
 	s.counters(g)
 }
