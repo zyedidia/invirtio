@@ -14,8 +14,7 @@ exports a VirtIO device to the host using VDUSE.
   are contained to kernel modules so they can be reloaded without rebooting the
   host kernel (after installing a custom kernel in the host).
 
-Run `./download.sh --shallow` to download the two Linux kernels and the Cloud
-Hypervisor fork used by the KVM prototype (`docs/KVM.md`).
+Run `./download.sh --shallow` to download the two Linux kernels.
 
 ## Requirements
 
@@ -147,3 +146,7 @@ remote login:
 ```
 sudo invirtio disable gpu-01-00-0
 ```
+
+# AI Assistance
+
+The code in this project has been written and reviewed with AI assistance.
