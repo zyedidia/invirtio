@@ -198,7 +198,10 @@ Tests:`+gpuTestList())
 		if err != nil {
 			return err
 		}
-		s.device = *device + ",rom=" + r
+		// The guest writes VRAM through the iGPU's BAR0, which native
+		// amdgpu maps write-combined, and the host's mappings of VRAM BOs
+		// take BAR0's memory type. The doorbells in BAR2 stay uncached.
+		s.device = *device + ",rom=" + r + ",wc_bars=0x1"
 	}
 	if s.out, err = filepath.Abs(*out); err != nil {
 		return err
@@ -207,18 +210,6 @@ Tests:`+gpuTestList())
 		return err
 	}
 	defer os.RemoveAll(s.logDir)
-	// The guest writes VRAM through BAR0, which native amdgpu maps
-	// write-combined, as are the host's mappings of VRAM BOs. The
-	// doorbells in BAR2, which is prefetchable too, become write-combined
-	// in the guest as well, where native amdgpu maps them uncached.
-	restore := func() {}
-	if s.device != "" {
-		if restore, err = prefetchableWC(); err != nil {
-			return err
-		}
-		defer restore()
-	}
-
 	// A signal fails the test that runs, and no other test runs. A second
 	// signal kills the guests and exits.
 	ctx, cancel := context.WithCancel(context.Background())
@@ -240,7 +231,6 @@ Tests:`+gpuTestList())
 		}
 		s.mu.Unlock()
 		fmt.Printf("the device %s stays attached, remove it with vdpa dev del once no process uses it\n", gpuName)
-		restore()
 		os.RemoveAll(s.logDir)
 		harness.CloseOutput()
 		os.Exit(1)
@@ -294,7 +284,11 @@ func (s *gpuSuite) setup() error {
 	if harness.Run("sh", "-c", "command -v vdpa").Code != 0 {
 		return fmt.Errorf("vdpa is not installed")
 	}
-	if err := harness.Modprobe("vduse", "vdpa", "virtio_vdpa", "virtio_gpu"); err != nil {
+	mods := []string{"vduse", "vdpa", "virtio_vdpa", "virtio_gpu"}
+	if s.device != "" {
+		mods = append(mods, "vfio-pci")
+	}
+	if err := harness.Modprobe(mods...); err != nil {
 		return err
 	}
 	if err := os.MkdirAll(s.out, 0755); err != nil {
@@ -1381,30 +1375,6 @@ func gpuTestBandwidth(s *gpuSuite) {
 	s.counters(g)
 }
 
-// prefetchableWCParam makes vfio-pci map prefetchable BARs, BAR0 among them,
-// write-combined when a guest opens the device.
-const prefetchableWCParam = "/sys/module/vfio_pci_core/parameters/prefetchable_wc"
-
-// prefetchableWC sets vfio-pci's prefetchable_wc, so that the host maps
-// VRAM write-combined, and returns a function that restores it.
-func prefetchableWC() (func(), error) {
-	if err := harness.Modprobe("vfio-pci"); err != nil {
-		return nil, err
-	}
-	old := harness.Read(prefetchableWCParam)
-	if old == "" {
-		return nil, fmt.Errorf("%s is missing, so the host kernel lacks write-combining for vfio-pci", prefetchableWCParam)
-	}
-	if err := harness.Write(prefetchableWCParam, "Y"); err != nil {
-		return nil, err
-	}
-	return func() {
-		if err := harness.Write(prefetchableWCParam, old); err != nil {
-			fmt.Printf("warning: cannot restore %s to %s: %v\n", prefetchableWCParam, old, err)
-		}
-	}, nil
-}
-
 var (
 	kmsModeRE = regexp.MustCompile(`(?m)^kms-flip: connector \d+, (\d+)x(\d+)@(\d+)$`)
 	kmsRateRE = regexp.MustCompile(`(?m)^kms-flip: (\d+) flips in ([0-9.]+) s, ([0-9.]+) Hz$`)
@@ -1476,10 +1446,10 @@ func gpuTestDisplay(s *gpuSuite) {
 
 // console waits until the guest has copied the host's console into its dumb
 // buffer, when the host's fbdev client gives the device a framebuffer device
-// as it appears. If that takes over 30 s, it writes the guest's state to
-// console.log, as blocked does.
+// within 5 s of its card. If the copy takes over 30 s, it writes the guest's
+// state to console.log, as blocked does.
 func (s *gpuSuite) console(g *harness.Guest) bool {
-	if !hasFB() {
+	if !harness.Wait(hasFB, 5*time.Second, 100*time.Millisecond) {
 		fmt.Println("console: the device has no framebuffer device, so no console is copied")
 		return true
 	}
