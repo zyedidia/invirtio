@@ -64,6 +64,12 @@ struct device {
 	const char *addr;
 	/* The expansion ROM image to give the guest, or NULL. */
 	const char *rom_path;
+	/*
+	 * The prefetchable BARs that vfio-pci maps write-combined, as a mask
+	 * of BAR numbers, or NULL to keep vfio-pci's setting, which a bind
+	 * resets to none.
+	 */
+	const char *wc_bars;
 	int group_id;
 	int group_fd;
 	int rom_fd;
@@ -131,10 +137,13 @@ static void usage(void)
 "guest inherits the launcher's stdin and stdout.\n"
 "\n"
 "  -u <user>     run the guest as this user, given as a name or uid[:gid]\n"
-"  -d <address>[,rom=<file>]\n"
+"  -d <address>[,rom=<file>][,wc_bars=<mask>]\n"
 "                pass through this PCI device, such as 0000:06:00.0. With\n"
 "                rom, the guest sees the image in <file> as the device's\n"
-"                expansion ROM. Can be repeated\n"
+"                expansion ROM. With wc_bars, vfio-pci maps the\n"
+"                prefetchable BARs in <mask>, such as 0x1 for BAR0,\n"
+"                write-combined. The options are separated by commas.\n"
+"                Can be repeated\n"
 "  -b            bind the devices to vfio-pci if they are not bound to it,\n"
 "                and bind a display controller again to keep it in D0\n"
 "  -e <type>,<name>,log=<file>\n"
@@ -532,6 +541,18 @@ static void setup_device(struct device *dev)
 			     dev->addr, state);
 		bind_to_vfio(dev->addr, driver);
 		close(fd);
+	}
+
+	/* A bind resets the setting, so it is written after the bind. */
+	if (dev->wc_bars) {
+		int err;
+
+		snprintf(path, sizeof(path),
+			 "/sys/bus/pci/devices/%s/wc_bars", dev->addr);
+		err = write_file(path, dev->wc_bars);
+		if (err)
+			die("cannot set the write-combined BARs of %s to %s: %s",
+			    dev->addr, dev->wc_bars, strerror(-err));
 	}
 }
 
@@ -2225,13 +2246,14 @@ int main(int argc, char **argv)
 			if (nr_devices == MAX_DEVICES)
 				die("at most %d devices are supported",
 				    MAX_DEVICES);
-			devices[nr_devices].addr = optarg;
-			end = strchr(optarg, ',');
-			if (end) {
-				*end++ = '\0';
-				if (strncmp(end, "rom=", 4) || !end[4])
+			devices[nr_devices].addr = strsep(&optarg, ",");
+			while ((end = strsep(&optarg, ","))) {
+				if (!strncmp(end, "rom=", 4) && end[4])
+					devices[nr_devices].rom_path = end + 4;
+				else if (!strncmp(end, "wc_bars=", 8) && end[8])
+					devices[nr_devices].wc_bars = end + 8;
+				else
 					die("cannot parse -d option '%s'", end);
-				devices[nr_devices].rom_path = end + 4;
 			}
 			nr_devices++;
 			break;
