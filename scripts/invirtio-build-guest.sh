@@ -19,7 +19,10 @@
 #                 a mac80211_hwsim radio and runs access points on three
 #                 others.
 #   amdgpu        the guest for the MS-A2's iGPU, with its firmware, which
-#                 exports a render node as a virtio-gpu device.
+#                 exports a render node as a virtio-gpu device, and which
+#                 invirtio-test test-gpu runs.
+#   invirtio-gpu  the guest of GPUs that invirtio install -gpu-guest takes,
+#                 the amdgpu guest with the driver guest's init.
 #
 # usage: invirtio-build-guest.sh [-t <target>] [<build dir>]
 #
@@ -41,7 +44,7 @@ TARGET=invirtio
 while getopts t:h opt; do
     case $opt in
     t) TARGET=$OPTARG ;;
-    *) sed -n '2,31s/^# \{0,1\}//p' "$0" >&2; exit 2 ;;
+    *) sed -n '2,32s/^# \{0,1\}//p' "$0" >&2; exit 2 ;;
     esac
 done
 shift $((OPTIND - 1))
@@ -78,9 +81,13 @@ wlan-test)
                -b "$(command -v hostapd)" -b "$(command -v iperf3)"
                -b "$(command -v iw)")
     ;;
-amdgpu)
+amdgpu | invirtio-gpu)
     FRAGMENTS=(driver-guest amdgpu-guest)
-    INITRAMFS=(-i "$ROOT/scripts/amdgpu-guest-init")
+    if [ "$TARGET" = amdgpu ]; then
+        INITRAMFS=(-i "$ROOT/scripts/amdgpu-guest-init")
+    else
+        INITRAMFS=(-i "$ROOT/scripts/invirtio-guest-init")
+    fi
     for f in gc_10_3_6_{ce,me,mec,mec2,pfp,rlc} psp_13_0_5_{toc,ta,asd} \
              sdma_5_2_6 dcn_3_1_5_dmcub vcn_3_1_2; do
         INITRAMFS+=(-f "amdgpu/$f.bin")
