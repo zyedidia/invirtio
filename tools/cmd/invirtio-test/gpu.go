@@ -91,6 +91,10 @@ const (
 // in the tests that send no commands that the device refuses.
 var gpuGuestCounters = []string{"invalid_commands"}
 
+// The size of the device's bounce region, in bytes, which holds the
+// backing of 2D resources besides the virtqueues' buffers.
+const gpuBounceSize = 256 << 20
+
 type gpuTest struct {
 	name  string
 	about string
@@ -110,6 +114,7 @@ var gpuTests = []gpuTest{
 	{"pressure", "with -device, host-visible buffers that exceed GTT, or with -vram visible VRAM, keep their contents while the guest evicts them on its own", gpuTestPressure},
 	{"bandwidth", "with -device, measures the CPU's bandwidth to a host-visible buffer in GTT, or with -vram in visible VRAM", gpuTestBandwidth},
 	{"display", "with -device and a monitor on the iGPU, GPU-rendered frames flip on the guest's connector at its refresh rate, under a moving cursor", gpuTestDisplay},
+	{"dumb", "with -device and a monitor on the iGPU, a dumb buffer and a dumb cursor show on the guest's connector, and the guest copies their damage from the bounce region", gpuTestDumb},
 	{"display-bench", "with -device and a monitor on the iGPU, vkmark renders its scenes on the guest's connector through KMS", gpuTestDisplayBench},
 	{"gl-bench", "with -device and a monitor on the iGPU, glmark2 renders its scenes off-screen through radeonsi", gpuTestGLBench},
 	{"gl-display-bench", "with -device and a monitor on the iGPU, glmark2 renders its scenes through radeonsi on the guest's connector", gpuTestGLDisplayBench},
@@ -175,7 +180,7 @@ Tests:`+gpuTestList())
 	rom := fs.String("rom", "", "the VBIOS image of the iGPU")
 	mesa := fs.String("mesa", filepath.Join(root, "build/mesa"), "the prefix of the Mesa that scripts/mesa-build.sh built")
 	runRE := fs.String("run", "", "run only the tests whose names match this regular expression")
-	vram := fs.Bool("vram", false, "with -device, place the mappable BOs that Mesa asks for in VRAM in CPU-visible VRAM, which the evict, pressure and bandwidth tests then use, and have vfio-pci map VRAM write-combined")
+	vram := fs.Bool("vram", false, "with -device, place the mappable BOs that Mesa asks for in VRAM in CPU-visible VRAM, which the evict, pressure and bandwidth tests then use")
 	fs.Parse(args)
 	if fs.NArg() != 0 || (*rom != "") != (*device != "") || (*vram && *device == "") {
 		fs.Usage()
@@ -202,8 +207,12 @@ Tests:`+gpuTestList())
 		return err
 	}
 	defer os.RemoveAll(s.logDir)
+	// The guest writes VRAM through BAR0, which native amdgpu maps
+	// write-combined, as are the host's mappings of VRAM BOs. The
+	// doorbells in BAR2, which is prefetchable too, become write-combined
+	// in the guest as well, where native amdgpu maps them uncached.
 	restore := func() {}
-	if s.vram {
+	if s.device != "" {
 		if restore, err = prefetchableWC(); err != nil {
 			return err
 		}
@@ -414,6 +423,16 @@ func (s *gpuSuite) startGuest(mem string, display bool) *harness.Guest {
 // attach adds the device to the vDPA bus and returns the host's render
 // node for it.
 func (s *gpuSuite) attach() string {
+	// The backing of 2D resources stays in the bounce region for the
+	// resources' lifetimes, and virtio_gpu lets it take half of the region.
+	// The size can only be set before the first attach of the device.
+	bounce := filepath.Join("/sys/class/vduse", gpuName, "bounce_size")
+	werr := harness.Write(bounce, strconv.Itoa(gpuBounceSize))
+	size := harness.Read(bounce)
+	if !s.Check(size == strconv.Itoa(gpuBounceSize),
+		"the device's bounce region is %d bytes, %s read back%s", gpuBounceSize, size, errSuffix(werr)) {
+		return ""
+	}
 	err := harness.Attach(gpuName)
 	if !s.Check(err == nil, "vdpa dev add attaches the device%s", errSuffix(err)) {
 		return ""
@@ -1421,12 +1440,16 @@ func gpuTestDisplay(s *gpuSuite) {
 		return
 	}
 
+	if !s.console(g) {
+		return
+	}
 	before := s.commands(g)
 	start := g.Counters()
 	out := s.runMesa("kms-flip.log", prog, card, strconv.Itoa(frames), "cursor")
 	mode := kmsModeRE.FindStringSubmatch(out)
 	rate := kmsRateRE.FindStringSubmatch(out)
 	if !s.Check(mode != nil && rate != nil, "kms-flip flips %d frames, see kms-flip.log", frames-1) {
+		s.blocked(g, "blocked.log")
 		return
 	}
 	refresh, _ := strconv.ParseFloat(mode[3], 64)
@@ -1448,9 +1471,111 @@ func gpuTestDisplay(s *gpuSuite) {
 		"the guest shows the cursor and moves it, %d updates and %d moves", updates, moves)
 	errors := c["cursor_errors"] - start["cursor_errors"]
 	s.Check(errors == 0, "the guest's cursor updates all succeed, %d fail", errors)
-	// The host's fbdev client sets up its console with a 2D resource, which
-	// the device refuses.
-	fmt.Printf("display: the guest refused %d commands\n", g.Counters()["invalid_commands"])
+	s.counters(g)
+}
+
+// console waits until the guest has copied the host's console into its dumb
+// buffer, when the host's fbdev client gives the device a framebuffer device
+// as it appears. If that takes over 30 s, it writes the guest's state to
+// console.log, as blocked does.
+func (s *gpuSuite) console(g *harness.Guest) bool {
+	if !hasFB() {
+		fmt.Println("console: the device has no framebuffer device, so no console is copied")
+		return true
+	}
+	start := time.Now()
+	ok := harness.Wait(func() bool { return g.Counters()["transfers"] > 0 }, 30*time.Second, 200*time.Millisecond)
+	if ok {
+		fmt.Printf("console: the guest copied the host's console after %.1f s\n", time.Since(start).Seconds())
+		return true
+	}
+	s.blocked(g, "console.log")
+	return s.Check(false, "the guest copies the host's console within 30 s, see console.log")
+}
+
+// hasFB reports whether the device has a framebuffer device, which the host's
+// fbdev client registers on the device's DRM device.
+func hasFB() bool {
+	dev, err := filepath.EvalSymlinks(filepath.Join("/sys/bus/vdpa/devices", gpuName))
+	if err != nil {
+		return false
+	}
+	for _, fb := range harness.Glob("/sys/class/graphics/fb*") {
+		if parent, err := filepath.EvalSymlinks(filepath.Join(fb, "device")); err == nil && parent == dev {
+			return true
+		}
+	}
+	return false
+}
+
+// blocked writes the guest's blocked tasks, its kernel log, its counters and
+// its VFIO counters to a file.
+func (s *gpuSuite) blocked(g *harness.Guest, file string) {
+	out := g.Output("echo w > /proc/sysrq-trigger; sleep 1; dmesg | tail -n 400; cat /proc/vduse_guest; cat /proc/vfio_uml", time.Minute)
+	if out == "" {
+		fmt.Println("the guest's shell does not answer, so its blocked tasks are unknown")
+		return
+	}
+	os.WriteFile(filepath.Join(s.dir, file), []byte(out), 0644)
+	fmt.Printf("the guest's blocked tasks are in %s\n", file)
+}
+
+var kmsDumbRE = regexp.MustCompile(`(?m)^kms-dumb: (\d+) frames in ([0-9.]+) s, ([0-9.]+) Hz$`)
+
+// gpuTestDumb runs testprogs/kms-dumb on the host's DRM card of the device,
+// in a guest that gives the device its connectors as scanouts. The program
+// shows a dumb buffer, a 2D resource whose backing virtio_gpu maps through
+// the device's bounce region, and marks a moving bar dirty on each frame. The
+// guest copies each frame's damage from the backing into its own dumb
+// buffer, and shows a dumb cursor that moves with the bar.
+func gpuTestDumb(s *gpuSuite) {
+	const frames = 300
+	if s.device == "" {
+		fmt.Println("the dumb test needs -device, so it is skipped")
+		return
+	}
+	prog := filepath.Join(harness.RepoRoot(), "build/kms-dumb")
+	if !s.Check(harness.Exists(prog), "%s is built, with make -C testprogs", prog) {
+		return
+	}
+	g := s.startGuest("2G", true)
+	if g == nil {
+		return
+	}
+	node := s.attach()
+	if node == "" {
+		return
+	}
+	card := s.card(node)
+	if card == "" {
+		return
+	}
+
+	if !s.console(g) {
+		return
+	}
+	start := g.Counters()
+	out := s.runMesa("kms-dumb.log", prog, card, strconv.Itoa(frames))
+	m := kmsDumbRE.FindStringSubmatch(out)
+	if !s.Check(m != nil, "kms-dumb draws %d frames, see kms-dumb.log", frames) {
+		s.blocked(g, "blocked.log")
+		return
+	}
+	fmt.Printf("dumb: %s frames at %s Hz\n", m[1], m[3])
+	var c map[string]int64
+	ok := harness.Wait(func() bool {
+		c = g.Counters()
+		return c["transfers"]-start["transfers"] >= frames
+	}, 2*time.Second, 100*time.Millisecond)
+	s.Check(ok, "the guest copies each frame's damage, %d transfers for %d frames",
+		c["transfers"]-start["transfers"], frames)
+	updates := c["cursor_updates"] - start["cursor_updates"]
+	moves := c["cursor_moves"] - start["cursor_moves"]
+	s.Check(updates >= 1 && moves >= frames-1,
+		"the guest shows the dumb cursor and moves it, %d updates and %d moves", updates, moves)
+	errors := c["cursor_errors"] - start["cursor_errors"]
+	s.Check(errors == 0, "the guest's cursor updates all succeed, %d fail", errors)
+	s.counters(g)
 }
 
 // card returns the DRM card that virtio_gpu registers next to a render node,
