@@ -1,12 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"os"
 	"os/user"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -21,10 +23,12 @@ func cmdEnable(args []string) error {
 	fs := flag.NewFlagSet("enable", flag.ExitOnError)
 	name := fs.String("name", "", "the device's name (default <type>-<address>)")
 	memory := fs.String("memory", "", "the guest's memory, such as 768M")
+	rom := fs.String("rom", "", "for a GPU, the expansion ROM image that its guest sees, such as the VBIOS of an APU")
+	mesa := fs.String("mesa", defaultMesaDir, "for a GPU, the Mesa prefix that graphical sessions take, which scripts/mesa-build.sh builds")
 	dry := fs.Bool("n", false, "show the commands of each stage without running them")
 	yes := fs.Bool("y", false, "run each stage without waiting for Enter")
 	fs.Usage = func() {
-		fmt.Fprintln(os.Stderr, "usage: invirtio enable [-n] [-y] [-name <name>] [-memory <size>] <pci address>\n\nRun the device's driver in a guest, now and at every boot, and export the\ndevice to the host as a virtio device. The host's own driver lets go of it.\nEach stage shows its commands and waits for Enter before it runs them.\nEnabling a device that is already recorded finishes enabling it.")
+		fmt.Fprintln(os.Stderr, "usage: invirtio enable [-n] [-y] [-name <name>] [-memory <size>] [-rom <file>] [-mesa <prefix>] <pci address>\n\nRun the device's driver in a guest, now and at every boot, and export the\ndevice to the host as a virtio device. The host's own driver lets go of it.\nA GPU's guest shows the host's display manager on the GPU's connectors\nuntil the next boot instead, and the host's own driver drives it at boot.\nEach stage shows its commands and waits for Enter before it runs them.\nEnabling a device that is already recorded finishes enabling it.")
 		fs.PrintDefaults()
 	}
 	fs.Parse(args)
@@ -39,17 +43,43 @@ func cmdEnable(args []string) error {
 	if err != nil {
 		return err
 	}
-	if _, err := os.Stat(guestPath); err != nil {
-		return errors.New("InvirtIO is not installed, run invirtio install")
-	}
-
 	typ, err := pci.Type(addr)
 	if err != nil {
 		return err
 	}
-	drv, err := pci.GuestDriver(addr, modinfoPath)
+	kernel, _, modinfo := guestFiles(typ)
+	if _, err := os.Stat(kernel); err != nil {
+		if typ == "gpu" {
+			return errors.New("the guest of GPUs is not installed, run invirtio install with -gpu-guest")
+		}
+		return errors.New("InvirtIO is not installed, run invirtio install")
+	}
+	drv, err := pci.GuestDriver(addr, modinfo)
 	if err != nil {
 		return err
+	}
+	mesaSet := false
+	fs.Visit(func(f *flag.Flag) { mesaSet = mesaSet || f.Name == "mesa" })
+	if typ == "gpu" {
+		if _, err := displayManager(); err != nil {
+			return err
+		}
+		if !*dry && graphicalSession() {
+			return errors.New("enabling a GPU ends the graphical sessions, so run it from a text console or a remote login")
+		}
+		if *mesa, err = filepath.Abs(*mesa); err != nil {
+			return err
+		}
+		if *rom != "" {
+			if *rom, err = filepath.Abs(*rom); err != nil {
+				return err
+			}
+			if _, err := os.Stat(*rom); err != nil {
+				return err
+			}
+		}
+	} else if *rom != "" || mesaSet {
+		return errors.New("-rom and -mesa are only for GPUs")
 	}
 	if err := pci.CheckGroup(addr); err != nil {
 		return err
@@ -74,10 +104,12 @@ func cmdEnable(args []string) error {
 	}
 	var record []action
 	if n, d, err := cfg.lookup(addr); err == nil {
-		if (*name != "" && *name != n) || (*memory != "" && *memory != d.Memory) {
+		if (*name != "" && *name != n) || (*memory != "" && *memory != d.Memory) ||
+			(*rom != "" && !sameContent(*rom, d.ROM)) || (mesaSet && *mesa != d.Mesa) {
 			return fmt.Errorf("%s is already recorded as %s, disable it to change it", addr, n)
 		}
 		*name = n
+		*mesa = d.Mesa
 	} else {
 		if *name == "" {
 			*name = defaultName(typ, addr)
@@ -88,7 +120,21 @@ func cmdEnable(args []string) error {
 		if _, ok := cfg.Devices[*name]; ok {
 			return fmt.Errorf("a device named %s is already enabled", *name)
 		}
-		cfg.Devices[*name] = &Device{Address: addr, Type: typ, Memory: *memory}
+		dev := &Device{Address: addr, Type: typ, Memory: *memory}
+		if typ == "gpu" {
+			// BAR0 is the VRAM aperture of an AMD GPU, which the guest
+			// writes, and the guest gives the host's display manager the
+			// connectors without fbdev emulation of its own.
+			dev.WCBars = "0x1"
+			dev.Mesa = *mesa
+			dev.Options = []string{"display"}
+			dev.Args = []string{"drm_kms_helper.fbdev_emulation=0"}
+			if *rom != "" {
+				dev.ROM = romPath(*name)
+				record = append(record, mkdirAction(configDir, 0755), copyAction(*rom, dev.ROM, 0644))
+			}
+		}
+		cfg.Devices[*name] = dev
 		a, err := configAction(cfg)
 		if err != nil {
 			return err
@@ -103,6 +149,30 @@ func cmdEnable(args []string) error {
 	fmt.Printf("%s is a %s device, which the guest drives with %s. On the host it has %s.\n\n",
 		addr, typ, drv, host)
 	unit := "invirtio@" + *name + ".service"
+	if typ == "gpu" {
+		if err := checkMesa(*mesa); err != nil {
+			return err
+		}
+		stages := []stage{
+			{title: "record the device as " + *name, actions: record},
+			{
+				title: "switch the display manager to " + *name + " until the next boot",
+				notes: "This ends the graphical sessions. A transient unit stops the display\n" +
+					"manager, makes it bind to " + unit + " and graphical sessions take\n" +
+					*mesa + ", and starts the display manager, which starts the guest\n" +
+					"first. If it does not start, everything goes back to the host's driver.\n" +
+					"Its log: journalctl -u invirtio-display-" + *name,
+				actions: []action{displayAction(true, *name)},
+			},
+		}
+		if err := runStages(stages, *dry, *yes); err != nil {
+			return err
+		}
+		if !*dry {
+			fmt.Printf("\nThe display manager runs on %s until the next boot. Switch back with: invirtio disable %s\n", *name, *name)
+		}
+		return nil
+	}
 	// The udev rule comes last, so that a device whose guest never started
 	// does not lose its host driver at the next boot.
 	stages := []stage{
@@ -155,6 +225,9 @@ func cmdDisable(args []string) error {
 	if err != nil {
 		return err
 	}
+	if dev.Type == "gpu" && !*dry && graphicalSession() {
+		return errors.New("disabling a GPU can end the graphical sessions, so run it from a text console or a remote login")
+	}
 
 	stages, err := disablePlan(cfg, name, dev)
 	if err != nil {
@@ -187,12 +260,32 @@ func disablePlan(cfg *Config, name string, dev *Device) ([]stage, error) {
 	if err != nil {
 		return nil, err
 	}
-	return append(stages, stage{title: "forget the device", actions: []action{record}}), nil
+	forget := []action{record}
+	if dev.ROM != "" {
+		forget = append(forget, removeAction(dev.ROM))
+	}
+	return append(stages, stage{title: "forget the device", actions: forget}), nil
 }
 
 // disableStages stops a device's guest, removes what a failed guest left on
-// the host, and returns the device to its host driver.
+// the host, and returns the device to its host driver. A GPU's display
+// manager goes back to the host's driver first.
 func disableStages(name string, dev *Device) []stage {
+	if dev.Type != "gpu" {
+		return guestStages(name, dev)
+	}
+	return append([]stage{{
+		title: name + ": switch the display manager back to the host's driver",
+		notes: "This ends the graphical sessions if the display manager runs on the guest.\n" +
+			"A transient unit stops it, stops the guest, returns the GPU to its host\n" +
+			"driver and starts it again. Its log: journalctl -u invirtio-display-" + name,
+		actions: []action{displayAction(false, name)},
+	}}, guestStages(name, dev)...)
+}
+
+// guestStages stops a device's guest, removes what a failed guest left on
+// the host, and returns the device to its host driver.
+func guestStages(name string, dev *Device) []stage {
 	unit := "invirtio@" + name + ".service"
 	vduse := "/sys/class/vduse/" + name
 	addr := dev.Address
@@ -308,6 +401,11 @@ func cmdUninstall(args []string) error {
 	if err != nil {
 		return err
 	}
+	for _, d := range cfg.Devices {
+		if d.Type == "gpu" && !*dry && graphicalSession() {
+			return errors.New("uninstalling with a GPU enabled can end the graphical sessions, so run it from a text console or a remote login")
+		}
+	}
 
 	stages := []stage{{
 		title:   "let the host's drivers take the devices at boot",
@@ -369,10 +467,37 @@ func udevActions(cfg *Config) []action {
 		var b strings.Builder
 		b.WriteString("# Written by invirtio enable and disable.\n")
 		for _, name := range cfg.names() {
+			// A GPU keeps its host driver at boot.
+			if cfg.Devices[name].Type == "gpu" {
+				continue
+			}
 			fmt.Fprintf(&b, "ACTION==\"add\", SUBSYSTEM==\"pci\", KERNEL==\"%s\", ATTR{driver_override}=\"vfio-pci\"\n",
 				cfg.Devices[name].Address)
 		}
 		write = writeAction(udevRulePath, b.String(), 0644)
 	}
 	return []action{write, cmdAction("udevadm", "control", "--reload")}
+}
+
+// removeAction removes a file, unless it is gone.
+func removeAction(path string) action {
+	return action{
+		show: showCmd("rm", "-f", path),
+		run: func() error {
+			if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return err
+			}
+			return nil
+		},
+	}
+}
+
+// sameContent reports whether two files hold the same bytes.
+func sameContent(a, b string) bool {
+	x, err := os.ReadFile(a)
+	if err != nil {
+		return false
+	}
+	y, err := os.ReadFile(b)
+	return err == nil && bytes.Equal(x, y)
 }

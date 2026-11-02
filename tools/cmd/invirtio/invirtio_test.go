@@ -153,6 +153,31 @@ func TestGuestArgs(t *testing.T) {
 	}
 }
 
+func TestGuestArgsGPU(t *testing.T) {
+	dev := &Device{Address: "0000:01:00.0", Type: "gpu", ROM: "/etc/invirtio/gpu-01-00-0.rom",
+		WCBars: "0x1", Options: []string{"display"}, Args: []string{"drm_kms_helper.fbdev_emulation=0"}}
+	got := strings.Join(guestArgs("gpu-01-00-0", dev, ""), " ")
+	want := "-u invirtio -b -d 0000:01:00.0,rom=/etc/invirtio/gpu-01-00-0.rom,wc_bars=0x1 " +
+		"-i /usr/lib/invirtio/initramfs-gpu.cpio -s /run/invirtio/gpu-01-00-0.mconsole -t 30 " +
+		"-e gpu,gpu-01-00-0,log=/run/invirtio/gpu-01-00-0/inflight -l 1024 " +
+		"/usr/lib/invirtio/linux-gpu mem=2G vduse_guest.device=gpu,gpu-01-00-0,display " +
+		"drm_kms_helper.fbdev_emulation=0"
+	if got != want {
+		t.Errorf("guestArgs =\n%s\nwant\n%s", got, want)
+	}
+}
+
+func TestUdevSkipsGPUs(t *testing.T) {
+	cfg := &Config{Devices: map[string]*Device{
+		"gpu-01-00-0": {Address: "0000:01:00.0", Type: "gpu"},
+		"net-05-00-0": {Address: "0000:05:00.0", Type: "net"},
+	}}
+	show := udevActions(cfg)[0].show
+	if strings.Contains(show, "0000:01:00.0") || !strings.Contains(show, "0000:05:00.0") {
+		t.Errorf("the udev rule should keep only the NIC from its host driver:\n%s", show)
+	}
+}
+
 func TestConsoleServer(t *testing.T) {
 	master, slave, err := openPty()
 	if err != nil {
@@ -282,7 +307,8 @@ func TestDisableDryRun(t *testing.T) {
 }
 
 func TestClassType(t *testing.T) {
-	cases := map[string]string{"0x028000": "wlan", "0x020000": "net", "0x010802": "", "0x0280": "wlan"}
+	cases := map[string]string{"0x028000": "wlan", "0x020000": "net", "0x010802": "", "0x0280": "wlan",
+		"0x030000": "gpu", "0x038000": "gpu"}
 	for class, want := range cases {
 		if got := pci.ClassType(class); got != want {
 			t.Errorf("pci.ClassType(%q) = %q, want %q", class, got, want)

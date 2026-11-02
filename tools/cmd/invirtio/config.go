@@ -40,6 +40,22 @@ var (
 	initrdPath   = filepath.Join(libDir, "initramfs.cpio")
 	launcherPath = filepath.Join(libDir, "invirtio-launch")
 	modinfoPath  = filepath.Join(libDir, "modules.builtin.modinfo")
+
+	// The guest of a GPU is a guest of its own, with the GPU's driver and
+	// firmware.
+	gpuGuestPath   = filepath.Join(libDir, "linux-gpu")
+	gpuInitrdPath  = filepath.Join(libDir, "initramfs-gpu.cpio")
+	gpuModinfoPath = filepath.Join(libDir, "modules-gpu.builtin.modinfo")
+)
+
+// A GPU's guest shows the host's display manager on the GPU's connectors
+// until the next boot, so the files that switch the display manager over are
+// under /run. The display manager binds to the guest's service, and graphical
+// sessions take the Mesa that renders through the guest from environment.d.
+const (
+	runUnitDir     = "/run/systemd/system"
+	runEnvPath     = "/run/environment.d/50-invirtio-mesa.conf"
+	defaultMesaDir = "/opt/invirtio/mesa"
 )
 
 // Device is one host device that a guest drives and exports.
@@ -57,6 +73,14 @@ type Device struct {
 	Args []string `json:"args,omitempty"`
 	// IRQCPUs, if set, are the host CPUs that the device's interrupts go to.
 	IRQCPUs string `json:"irq_cpus,omitempty"`
+	// ROM, if set, is the expansion ROM image that the guest sees.
+	ROM string `json:"rom,omitempty"`
+	// WCBars, if set, is the mask of the prefetchable BARs that vfio-pci
+	// maps write-combined.
+	WCBars string `json:"wc_bars,omitempty"`
+	// Mesa is the Mesa prefix that graphical sessions take while a GPU's
+	// guest shows the display manager.
+	Mesa string `json:"mesa,omitempty"`
 }
 
 type Config struct {
@@ -66,6 +90,16 @@ type Config struct {
 var defaultMemory = map[string]string{
 	"wlan": "256M",
 	"net":  "256M",
+	"gpu":  "2G",
+}
+
+// guestFiles returns the guest kernel, initramfs and list of built-in modules
+// of a device's type.
+func guestFiles(typ string) (kernel, initrd, modinfo string) {
+	if typ == "gpu" {
+		return gpuGuestPath, gpuInitrdPath, gpuModinfoPath
+	}
+	return guestPath, initrdPath, modinfoPath
 }
 
 func (d *Device) memory() string {

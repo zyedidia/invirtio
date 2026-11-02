@@ -49,18 +49,20 @@ func Type(addr string) (string, error) {
 	if typ := ClassType(class); typ != "" {
 		return typ, nil
 	}
-	return "", fmt.Errorf("%s has PCI class %s, which is neither a WiFi nor an Ethernet controller", addr, class)
+	return "", fmt.Errorf("%s has PCI class %s, which is not a WiFi, Ethernet or display controller", addr, class)
 }
 
 // ClassType returns the backend for a PCI class as sysfs gives it, or "".
-// Network controllers of the "other" subclass are WiFi cards, and Ethernet
-// controllers are NICs.
+// Network controllers of the "other" subclass are WiFi cards, Ethernet
+// controllers are NICs, and display controllers are GPUs.
 func ClassType(class string) string {
 	switch {
 	case strings.HasPrefix(class, "0x0280"):
 		return "wlan"
 	case strings.HasPrefix(class, "0x0200"):
 		return "net"
+	case strings.HasPrefix(class, "0x03"):
+		return "gpu"
 	}
 	return ""
 }

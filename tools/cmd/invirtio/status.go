@@ -86,7 +86,8 @@ func showDevice(name string, dev *Device, level int) {
 		host = "none"
 	}
 	row("host driver", host)
-	if drv, err := pci.GuestDriver(dev.Address, modinfoPath); err == nil {
+	_, _, modinfo := guestFiles(dev.Type)
+	if drv, err := pci.GuestDriver(dev.Address, modinfo); err == nil {
 		row("guest driver", drv)
 	} else {
 		row("guest driver", "none")

@@ -17,7 +17,7 @@ import (
 func cmdList(args []string) error {
 	fs := flag.NewFlagSet("list", flag.ExitOnError)
 	fs.Usage = func() {
-		fmt.Fprintln(os.Stderr, "usage: invirtio list\n\nList the host's WiFi and Ethernet devices, the host driver that has each\nnow, the guest driver that would drive it, and the name it is enabled as.")
+		fmt.Fprintln(os.Stderr, "usage: invirtio list\n\nList the host's WiFi, Ethernet and display devices, the host driver that\nhas each now, the guest driver that would drive it, and the name it is\nenabled as.")
 	}
 	fs.Parse(args)
 	if fs.NArg() != 0 {
@@ -34,8 +34,8 @@ func cmdList(args []string) error {
 	if err != nil {
 		return err
 	}
-	modinfo, modinfoErr := os.ReadFile(modinfoPath)
 	names := lspciNames()
+	missing := false
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 	fmt.Fprintln(w, "ADDRESS\tTYPE\tHOST DRIVER\tGUEST DRIVER\tENABLED AS\tDEVICE")
@@ -57,7 +57,10 @@ func cmdList(args []string) error {
 			host = "none"
 		}
 		guest := "unknown"
-		if modinfoErr == nil {
+		_, _, modinfoPath := guestFiles(typ)
+		modinfo, err := os.ReadFile(modinfoPath)
+		missing = missing || err != nil
+		if err == nil {
 			alias, _ := sysfs.Read(filepath.Join(p, "modalias"))
 			guest = pci.MatchDriver(alias, modinfo)
 			if guest == "" {
@@ -77,10 +80,10 @@ func cmdList(args []string) error {
 	w.Flush()
 
 	if !found {
-		fmt.Println("The host has no WiFi or Ethernet devices on PCI.")
+		fmt.Println("The host has no WiFi, Ethernet or display devices on PCI.")
 	}
-	if modinfoErr != nil {
-		fmt.Println("\nThe guest is not installed, so its drivers are unknown. Run invirtio install.")
+	if missing {
+		fmt.Println("\nA guest is not installed, so its drivers are unknown. Run invirtio install, with -gpu-guest for GPUs.")
 	}
 	return nil
 }

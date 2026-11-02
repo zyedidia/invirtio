@@ -1,16 +1,17 @@
 // Command invirtio installs InvirtIO and manages the driver guests that
-// export a host's WiFi and Ethernet devices as virtio devices.
+// export a host's WiFi, Ethernet and GPU devices as virtio devices.
 //
 // Usage:
 //
-//	invirtio install [-n] [-y] -guest <build dir> [-initramfs <file>] [-launcher <file>]
+//	invirtio install [-n] [-y] -guest <build dir> [-initramfs <file>] [-launcher <file>] [-gpu-guest <build dir>]
 //	invirtio uninstall [-n] [-y]
-//	invirtio enable [-n] [-y] [-name <name>] [-memory <size>] <pci address>
+//	invirtio enable [-n] [-y] [-name <name>] [-memory <size>] [-rom <file>] [-mesa <prefix>] <pci address>
 //	invirtio disable [-n] [-y] <name | pci address>
 //	invirtio list
 //	invirtio status [-v] [<name>]
 //	invirtio console <name>
 //	invirtio run <name>
+//	invirtio display on|off <name>
 //
 // Each enabled device runs in a guest of its own, as the systemd service
 // invirtio@<name>, which runs "invirtio run <name>".
@@ -32,10 +33,12 @@ Commands:
   uninstall  disable every device and remove what install added
   enable     run a device's driver in a guest and export it to the host
   disable    stop a device's guest and return the device to its host driver
-  list       list the host's WiFi and Ethernet devices and their drivers
+  list       list the host's WiFi, Ethernet and display devices and their drivers
   status     show the state of the devices
   console    attach to a device's guest console, Ctrl-] detaches
   run        run a device's guest, as the service does
+  display    switch the display manager to a GPU's guest and back, as
+             enable and disable do
 
 Run "invirtio <command> -h" for a command's options.
 `)
@@ -111,6 +114,8 @@ func main() {
 		err = cmdConsole(args)
 	case "run":
 		err = cmdRun(args)
+	case "display":
+		err = cmdDisplay(args)
 	default:
 		usage()
 	}

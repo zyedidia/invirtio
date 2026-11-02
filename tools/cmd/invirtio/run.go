@@ -50,8 +50,9 @@ func cmdRun(args []string) error {
 	if err != nil {
 		return err
 	}
-	if _, err := os.Stat(guestPath); err != nil {
-		return fmt.Errorf("InvirtIO is not installed, run invirtio install")
+	kernel, _, _ := guestFiles(dev.Type)
+	if _, err := os.Stat(kernel); err != nil {
+		return fmt.Errorf("the guest of a %s device is not installed, run invirtio install", dev.Type)
 	}
 	return supervise(name, dev)
 }
@@ -59,17 +60,32 @@ func cmdRun(args []string) error {
 // modules returns the host modules that a device of the type needs.
 func modules(typ string) []string {
 	mods := []string{"vfio-pci", "vduse", "vdpa", "virtio_vdpa"}
-	if typ == "wlan" {
+	switch typ {
+	case "wlan":
 		mods = append(mods, "virtio_wlan")
+	case "gpu":
+		mods = append(mods, "virtio_gpu")
 	}
 	return mods
 }
 
 func guestArgs(name string, dev *Device, cgroup string) []string {
+	kernel, initrd, _ := guestFiles(dev.Type)
+	device := dev.Address
+	if dev.ROM != "" {
+		device += ",rom=" + dev.ROM
+	}
+	if dev.WCBars != "" {
+		device += ",wc_bars=" + dev.WCBars
+	}
 	args := []string{
-		"-u", guestUser, "-b", "-d", dev.Address, "-i", initrdPath,
+		"-u", guestUser, "-b", "-d", device, "-i", initrd,
 		"-s", mconsolePath(name), "-t", "30",
 		"-e", fmt.Sprintf("%s,%s,log=%s", dev.Type, name, logPath(name)),
+	}
+	// A GPU's guest pins the BOs that the GPU reaches in system memory.
+	if dev.Type == "gpu" {
+		args = append(args, "-l", "1024")
 	}
 	if cgroup != "" {
 		args = append(args, "-g", cgroup)
@@ -77,11 +93,11 @@ func guestArgs(name string, dev *Device, cgroup string) []string {
 	if dev.IRQCPUs != "" {
 		args = append(args, "-a", dev.IRQCPUs)
 	}
-	device := "vduse_guest.device=" + dev.Type + "," + name
+	backend := "vduse_guest.device=" + dev.Type + "," + name
 	for _, opt := range dev.Options {
-		device += "," + opt
+		backend += "," + opt
 	}
-	args = append(args, guestPath, "mem="+dev.memory(), device)
+	args = append(args, kernel, "mem="+dev.memory(), backend)
 	return append(args, dev.Args...)
 }
 
@@ -115,11 +131,11 @@ func supervise(name string, dev *Device) error {
 		return fmt.Errorf("cannot mount the tmpfs for the in-flight log: %v", err)
 	}
 
-	// A wlan device cannot be taken over by a new guest, so one that an
-	// earlier guest left on the bus is removed. A net device stays, and the
-	// guest reconnects to it.
-	if dev.Type == "wlan" {
-		cleanup(name)
+	// A wlan or gpu device cannot be taken over by a new guest, so one that
+	// an earlier guest left on the bus is removed. A net device stays, and
+	// the guest reconnects to it.
+	if dev.Type != "net" {
+		cleanup(name, dev.Type == "gpu")
 	}
 
 	cgroup, err := setupCgroup(name, dev)
@@ -215,7 +231,7 @@ func supervise(name string, dev *Device) error {
 	}()
 
 	var launcherGone atomic.Bool
-	att := startAttacher(name, &launcherGone)
+	att := startAttacher(name, dev.Type, &launcherGone)
 
 	exited := make(chan error, 1)
 	go func() {
@@ -224,7 +240,8 @@ func supervise(name string, dev *Device) error {
 		exited <- err
 	}()
 
-	stopping := false
+	stopping, failed, released := false, false, false
+	attFailed := att.failed
 	var waitErr error
 wait:
 	for {
@@ -244,6 +261,10 @@ wait:
 				// The host resets the device as it removes it, which the
 				// guest answers while it still runs.
 				att.stop()
+				if dev.Type == "gpu" {
+					waitReleased(name)
+					released = true
+				}
 				if err := vdpa.Remove(name, launcherGone.Load()); err != nil {
 					warn("%v", err)
 				}
@@ -252,6 +273,18 @@ wait:
 			cmd.Process.Signal(syscall.SIGTERM)
 		case waitErr = <-exited:
 			break wait
+		case <-attFailed:
+			// A guest whose device never reaches the host is stopped, so
+			// that the service fails rather than waits.
+			attFailed = nil
+			if !stopping {
+				stopping = true
+				failed = true
+				logf("stopping the guest of %s, whose device did not reach the host", name)
+				att.stop()
+				vdpa.Remove(name, launcherGone.Load())
+				cmd.Process.Signal(syscall.SIGTERM)
+			}
 		}
 	}
 	// A stop signal that came as the launcher exited is still a stop.
@@ -276,12 +309,27 @@ wait:
 		}
 	}
 
-	// A net device stays on the bus only if a live guest had it there and
-	// it is still there.
-	if stopping || dev.Type == "wlan" || !live || !vdpa.Attached(name) {
-		cleanup(name)
+	// A GPU's guest that exited by itself while the display manager runs on
+	// it leaves the display manager and its clients on the device, which
+	// stop only once this service has stopped. The device stays on the bus,
+	// and a transient unit switches the display manager back to the host's
+	// driver, which removes it.
+	_, switched := os.Stat(guestDropinPath(name))
+	if !stopping && dev.Type == "gpu" && switched == nil {
+		logf("switching the display manager back from %s", name)
+		if err := command.Run("systemd-run", "--no-block", "--collect", "--quiet",
+			"--unit=invirtio-display-"+name, binPath, "display", "off", name); err != nil {
+			warn("%v", err)
+		}
+	} else if stopping || dev.Type != "net" || !live || !vdpa.Attached(name) {
+		// A net device stays on the bus only if a live guest had it there
+		// and it is still there.
+		cleanup(name, dev.Type == "gpu" && !released)
 	} else if vdpa.Attached(name) {
 		logf("%s stays on the vDPA bus for the next guest", name)
+	}
+	if failed {
+		return fmt.Errorf("the device of %s did not reach the host", name)
 	}
 	if stopping {
 		return nil
@@ -329,8 +377,12 @@ func isMountPoint(dir string) bool {
 	return st.Dev != parent.Dev
 }
 
-// cleanup removes a device whose guest is gone from the host.
-func cleanup(name string) {
+// cleanup removes a device whose guest is gone from the host, once no
+// process has its DRM nodes open if wait is set.
+func cleanup(name string, wait bool) {
+	if wait {
+		waitReleased(name)
+	}
 	if err := vdpa.Remove(name, true); err != nil {
 		warn("%v", err)
 	}
@@ -350,14 +402,23 @@ type attacher struct {
 	// so it never sets live.
 	live bool
 	done chan struct{}
+	// failed is closed when the device does not reach the host.
+	failed chan struct{}
 }
 
-func startAttacher(name string, launcherGone *atomic.Bool) *attacher {
-	a := &attacher{done: make(chan struct{})}
+func startAttacher(name, typ string, launcherGone *atomic.Bool) *attacher {
+	a := &attacher{done: make(chan struct{}), failed: make(chan struct{})}
 	go func() {
 		defer close(a.done)
+		ok := false
+		defer func() {
+			if !ok && !a.isStopped() {
+				close(a.failed)
+			}
+		}()
 		deadline := time.Now().Add(attachTimeout)
 		var last error
+		bounced := false
 		for time.Now().Before(deadline) {
 			a.mu.Lock()
 			if a.stopped {
@@ -372,9 +433,30 @@ func startAttacher(name string, launcherGone *atomic.Bool) *attacher {
 					warn("%s is on the vDPA bus, but not on virtio_vdpa: %v", name, err)
 					return
 				}
-				logf("%s is on the vDPA bus, host interface %s",
-					name, strings.Join(waitInterfaces(name), ", "))
+				ok = true
+				if typ == "gpu" {
+					card := waitCard(name)
+					if card == "" {
+						warn("%s is on the vDPA bus, but virtio_gpu registered no DRM card for it", name)
+						ok = false
+						return
+					}
+					logf("%s is on the vDPA bus, host DRM card %s", name, card)
+				} else {
+					logf("%s is on the vDPA bus, host interface %s",
+						name, strings.Join(waitInterfaces(name), ", "))
+				}
+				notifyReady()
 				return
+			}
+			// The backing of a GPU's 2D resources stays in the bounce
+			// region, which VDUSE sizes before the first attach.
+			if vdpa.Exists(name) && typ == "gpu" && !bounced {
+				if err := sysfs.Write(filepath.Join("/sys/class/vduse", name, "bounce_size"),
+					strconv.Itoa(gpuBounceSize)); err != nil {
+					warn("cannot set the bounce region of %s to %d bytes: %v", name, gpuBounceSize, err)
+				}
+				bounced = true
 			}
 			if vdpa.Exists(name) {
 				last = vdpa.Add(name)
@@ -391,6 +473,12 @@ func startAttacher(name string, launcherGone *atomic.Bool) *attacher {
 	return a
 }
 
+func (a *attacher) isStopped() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.stopped
+}
+
 func (a *attacher) isLive() bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -403,6 +491,93 @@ func (a *attacher) stop() {
 	a.stopped = true
 	a.mu.Unlock()
 	<-a.done
+}
+
+// The size of a GPU's bounce region, in bytes, of which virtio_gpu lets the
+// backing of 2D resources take half.
+const gpuBounceSize = 256 << 20
+
+// waitCard gives virtio_gpu a moment to register a device's DRM card, and
+// returns its name, or "".
+func waitCard(name string) string {
+	for i := 0; i < 100; i++ {
+		cards, _ := filepath.Glob(filepath.Join("/sys/bus/vdpa/devices", name, "drm", "card*"))
+		if len(cards) > 0 {
+			return filepath.Base(cards[0])
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return ""
+}
+
+// waitReleased waits until no process has the DRM nodes of a GPU's device
+// open, for up to a minute, since removing virtio_gpu's device from under an
+// open file breaks the host.
+func waitReleased(name string) {
+	var pids []string
+	for i := 0; i < 600; i++ {
+		if pids = drmHolders(name); len(pids) == 0 {
+			return
+		}
+		if i == 0 {
+			logf("waiting for the processes %s to close the DRM nodes of %s", strings.Join(pids, ", "), name)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	warn("the processes %s still have the DRM nodes of %s open", strings.Join(pids, ", "), name)
+}
+
+// drmHolders returns the processes that have a DRM node of a device open, by
+// the nodes' device numbers.
+func drmHolders(name string) []string {
+	nodes := map[uint64]bool{}
+	files, _ := filepath.Glob(filepath.Join("/sys/bus/vdpa/devices", name, "drm", "*", "dev"))
+	for _, f := range files {
+		var major, minor uint32
+		if data, err := os.ReadFile(f); err == nil {
+			if _, err := fmt.Sscanf(string(data), "%d:%d", &major, &minor); err == nil {
+				nodes[unix.Mkdev(major, minor)] = true
+			}
+		}
+	}
+	if len(nodes) == 0 {
+		return nil
+	}
+	seen := map[string]bool{}
+	var pids []string
+	fds, _ := filepath.Glob("/proc/[0-9]*/fd/*")
+	for _, fd := range fds {
+		var st unix.Stat_t
+		if unix.Stat(fd, &st) != nil || st.Mode&unix.S_IFMT != unix.S_IFCHR || !nodes[st.Rdev] {
+			continue
+		}
+		if pid := strings.Split(fd, "/")[2]; !seen[pid] {
+			seen[pid] = true
+			pids = append(pids, pid)
+		}
+	}
+	return pids
+}
+
+// notifyReady tells systemd that the device is on the host, which a service
+// of Type=notify waits for.
+func notifyReady() {
+	sock := os.Getenv("NOTIFY_SOCKET")
+	if sock == "" {
+		return
+	}
+	if sock[0] == '@' {
+		sock = "\x00" + sock[1:]
+	}
+	conn, err := net.DialUnix("unixgram", nil, &net.UnixAddr{Name: sock, Net: "unixgram"})
+	if err != nil {
+		warn("cannot tell systemd that the device is ready: %v", err)
+		return
+	}
+	defer conn.Close()
+	if _, err := conn.Write([]byte("READY=1")); err != nil {
+		warn("cannot tell systemd that the device is ready: %v", err)
+	}
 }
 
 // waitInterfaces gives the host's driver a moment to make its interface.

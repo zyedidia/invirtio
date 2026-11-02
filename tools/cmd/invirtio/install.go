@@ -41,10 +41,11 @@ func cmdInstall(args []string) error {
 	guest := fs.String("guest", "", "the build directory of the guest, with linux and modules.builtin.modinfo")
 	initrd := fs.String("initramfs", "", "the guest's initramfs (default <guest>/initramfs/initramfs.cpio)")
 	launcher := fs.String("launcher", "", "the launcher (default invirtio-launch next to this program)")
+	gpuGuest := fs.String("gpu-guest", "", "the build directory of the guest of GPUs, with linux, modules.builtin.modinfo and initramfs/initramfs.cpio")
 	dry := fs.Bool("n", false, "show the commands of each stage without running them")
 	yes := fs.Bool("y", false, "run each stage without waiting for Enter")
 	fs.Usage = func() {
-		fmt.Fprintln(os.Stderr, "usage: invirtio install [-n] [-y] -guest <build dir> [-initramfs <file>] [-launcher <file>]\n\nInstall the guest, the launcher, this program and the service. Each stage\nshows its commands and waits for Enter before it runs them. Running guests\nkeep the old guest until they restart.")
+		fmt.Fprintln(os.Stderr, "usage: invirtio install [-n] [-y] -guest <build dir> [-initramfs <file>] [-launcher <file>] [-gpu-guest <build dir>]\n\nInstall the guest, the launcher, this program and the service, and with\n-gpu-guest the guest of GPUs. Each stage shows its commands and waits for\nEnter before it runs them. Running guests keep the old guest until they\nrestart.")
 		fs.PrintDefaults()
 	}
 	fs.Parse(args)
@@ -75,6 +76,16 @@ func cmdInstall(args []string) error {
 		{*initrd, initrdPath, 0644},
 		{*launcher, launcherPath, 0755},
 		{self, binPath, 0755},
+	}
+	if *gpuGuest != "" {
+		files = append(files, []struct {
+			src, dst string
+			mode     os.FileMode
+		}{
+			{filepath.Join(*gpuGuest, "linux"), gpuGuestPath, 0755},
+			{filepath.Join(*gpuGuest, "modules.builtin.modinfo"), gpuModinfoPath, 0644},
+			{filepath.Join(*gpuGuest, "initramfs", "initramfs.cpio"), gpuInitrdPath, 0644},
+		}...)
 	}
 	copies := []action{mkdirAction(libDir, 0755)}
 	for _, f := range files {
