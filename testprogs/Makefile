@@ -1,6 +1,6 @@
 OUT ?= ../build
 CFLAGS ?= -O2 -Wall -Wextra
-PROGS = $(OUT)/vk-dmabuf-share $(OUT)/vk-evict $(OUT)/vk-pressure $(OUT)/vk-bandwidth $(OUT)/vk-blobs $(OUT)/kms-flip
+PROGS = $(OUT)/vk-dmabuf-share $(OUT)/vk-evict $(OUT)/vk-pressure $(OUT)/vk-bandwidth $(OUT)/vk-blobs $(OUT)/kms-flip $(OUT)/kms-dumb
 
 all: $(PROGS)
 
@@ -20,3 +20,8 @@ $(OUT)/kms-flip: kms-flip.c
 	$(CC) $(CFLAGS) -I$(MESA_SRC)/include -I$(MESA)/include \
 		$$(pkg-config --cflags libdrm) -o $@ $< -L$(MESA)/lib -lgbm \
 		-l:libEGL.so.1 -l:libGLESv2.so.2 $$(pkg-config --libs libdrm)
+
+$(OUT)/kms-dumb: kms-dumb.c
+	mkdir -p $(OUT)
+	$(CC) $(CFLAGS) $$(pkg-config --cflags libdrm) -o $@ $< \
+		$$(pkg-config --libs libdrm)
