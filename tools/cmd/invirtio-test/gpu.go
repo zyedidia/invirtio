@@ -109,7 +109,10 @@ var gpuTests = []gpuTest{
 	{"evict", "with -device, a host-visible buffer keeps its contents across evictions from GTT, or with -vram from VRAM, in the guest", gpuTestEvict},
 	{"pressure", "with -device, host-visible buffers that exceed GTT, or with -vram visible VRAM, keep their contents while the guest evicts them on its own", gpuTestPressure},
 	{"bandwidth", "with -device, measures the CPU's bandwidth to a host-visible buffer in GTT, or with -vram in visible VRAM", gpuTestBandwidth},
-	{"display", "with -device and a monitor on the iGPU, GPU-rendered frames flip on the guest's connector at its refresh rate", gpuTestDisplay},
+	{"display", "with -device and a monitor on the iGPU, GPU-rendered frames flip on the guest's connector at its refresh rate, under a moving cursor", gpuTestDisplay},
+	{"display-bench", "with -device and a monitor on the iGPU, vkmark renders its scenes on the guest's connector through KMS", gpuTestDisplayBench},
+	{"gl-bench", "with -device and a monitor on the iGPU, glmark2 renders its scenes off-screen through radeonsi", gpuTestGLBench},
+	{"gl-display-bench", "with -device and a monitor on the iGPU, glmark2 renders its scenes through radeonsi on the guest's connector", gpuTestGLDisplayBench},
 	{"deqp", "with -device, dEQP's synchronization and external memory tests pass through native context", gpuTestDeqp},
 }
 
@@ -1392,7 +1395,8 @@ var (
 // program flips frames that radeonsi renders through native context, and
 // the guest shows each on its connector. The host's flush of each frame
 // waits for the flip, so the flips come at the mode's refresh rate, paced by
-// the flips and not by the host's vblank timer.
+// the flips and not by the host's vblank timer. A GBM cursor moves on each
+// frame, which the guest shows on the CRTC's cursor plane.
 func gpuTestDisplay(s *gpuSuite) {
 	const frames = 301
 	if s.device == "" {
@@ -1411,15 +1415,14 @@ func gpuTestDisplay(s *gpuSuite) {
 	if node == "" {
 		return
 	}
-	cards := harness.Glob(filepath.Join("/sys/class/drm", filepath.Base(node), "device/drm/card*"))
-	if !s.Check(len(cards) > 0, "virtio_gpu registers a card next to %s", node) {
+	card := s.card(node)
+	if card == "" {
 		return
 	}
-	card := "/dev/dri/" + filepath.Base(cards[0])
 
 	before := s.commands(g)
-	flips := g.Counters()["flips"]
-	out := s.runMesa("kms-flip.log", prog, card, strconv.Itoa(frames))
+	start := g.Counters()
+	out := s.runMesa("kms-flip.log", prog, card, strconv.Itoa(frames), "cursor")
 	mode := kmsModeRE.FindStringSubmatch(out)
 	rate := kmsRateRE.FindStringSubmatch(out)
 	if !s.Check(mode != nil && rate != nil, "kms-flip flips %d frames, see kms-flip.log", frames-1) {
@@ -1436,9 +1439,189 @@ func gpuTestDisplay(s *gpuSuite) {
 		fmt.Printf("display: in the guest, a flip's commit takes %d us and its flip comes %d us after its command\n",
 			c["flip_commit_us"]/n, c["flip_wait_us"]/n)
 	}
-	flipped := c["flips"] - flips
+	flipped := c["flips"] - start["flips"]
 	s.Check(flipped >= frames-1, "the host's flushes wait for the guest's flips, %d of %d", flipped, frames-1)
+	updates := c["cursor_updates"] - start["cursor_updates"]
+	moves := c["cursor_moves"] - start["cursor_moves"]
+	s.Check(updates >= 1 && moves >= frames-1,
+		"the guest shows the cursor and moves it, %d updates and %d moves", updates, moves)
+	errors := c["cursor_errors"] - start["cursor_errors"]
+	s.Check(errors == 0, "the guest's cursor updates all succeed, %d fail", errors)
 	// The host's fbdev client sets up its console with a 2D resource, which
 	// the device refuses.
 	fmt.Printf("display: the guest refused %d commands\n", g.Counters()["invalid_commands"])
+}
+
+// card returns the DRM card that virtio_gpu registers next to a render node,
+// for a device with scanouts.
+func (s *gpuSuite) card(node string) string {
+	cards := harness.Glob(filepath.Join("/sys/class/drm", filepath.Base(node), "device/drm/card*"))
+	if !s.Check(len(cards) > 0, "virtio_gpu registers a card next to %s", node) {
+		return ""
+	}
+	return "/dev/dri/" + filepath.Base(cards[0])
+}
+
+// gpuTestDisplayBench runs vkmark's default scenes on the host's DRM card of
+// the device, in a guest that gives the device its connectors as scanouts.
+// RADV renders the frames through native context. With mailbox presentation,
+// vkmark flips a frame only when no flip is pending and drops the others, so
+// it need not wait for each flip, and its scores measure rendering with the
+// display in use. They compare with the same command on the iGPU natively.
+func gpuTestDisplayBench(s *gpuSuite) {
+	if s.device == "" {
+		fmt.Println("the display-bench test needs -device, so it is skipped")
+		return
+	}
+	if !s.Check(harness.Exists(filepath.Join(s.mesa, "lib/libvulkan_radeon.so")),
+		"the Mesa prefix %s is built", s.mesa) {
+		return
+	}
+	g := s.startGuest("2G", true)
+	if g == nil {
+		return
+	}
+	node := s.attach()
+	if node == "" {
+		return
+	}
+	card := s.card(node)
+	if card == "" {
+		return
+	}
+
+	before := s.commands(g)
+	flips := g.Counters()["flips"]
+	ctx, cancel := context.WithTimeout(s.ctx, 10*time.Minute)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "vkmark", "--winsys", "kms", "-p", "mailbox",
+		"--winsys-options", "kms-drm-device="+card)
+	cmd.Env = s.mesaEnv()
+	out, err := cmd.CombinedOutput()
+	os.WriteFile(filepath.Join(s.dir, "vkmark.log"), out, 0644)
+	log := string(out)
+	s.Check(err == nil, "vkmark finishes%s, see vkmark.log", errSuffix(err))
+	s.Check(strings.Contains(log, "RADV"), "vkmark uses RADV")
+	s.Check(!strings.Contains(log, "DEVICE_LOST"), "the device is never lost")
+
+	for _, m := range vkmarkSceneRE.FindAllStringSubmatch(log, -1) {
+		fmt.Printf("vkmark: %-10s %s: %s FPS, %s ms\n", m[1], m[2], m[3], m[4])
+	}
+	m := vkmarkScoreRE.FindStringSubmatch(log)
+	score := 0
+	if m != nil {
+		score, _ = strconv.Atoi(m[1])
+	}
+	s.Check(score > 0, "vkmark reports a score, %d", score)
+	c := g.Counters()
+	served := c["commands"] - before
+	s.Check(before >= 0 && served > 1000, "the guest serves vkmark's commands, %d", served)
+	s.Check(c["flips"]-flips > 0, "the guest shows vkmark's frames, %d that the host waited for", c["flips"]-flips)
+	if n := c["flips_timed"]; n > 0 {
+		fmt.Printf("display-bench: in the guest, a flip's commit takes %d us and its flip comes %d us after its command\n",
+			c["flip_commit_us"]/n, c["flip_wait_us"]/n)
+	}
+	s.checkHostVisible(g, card)
+}
+
+var glmark2ScoreRE = regexp.MustCompile(`(?m)^\s*glmark2 Score: (\d+)\s*$`)
+var glRendererRE = regexp.MustCompile(`(?m)^\s*GL_RENDERER:.*radeonsi`)
+
+// gpuTestGLBench runs glmark2's default scenes off-screen with radeonsi
+// through native context on the host's DRM card of the device, and reports
+// the score, which compares with the same command on the iGPU natively.
+func gpuTestGLBench(s *gpuSuite) {
+	s.glmark2("gl-bench", false)
+}
+
+// gpuTestGLDisplayBench runs glmark2's default scenes on the guest's
+// connector through KMS, with mailbox swaps so that it need not wait for
+// each flip, and reports the score.
+func gpuTestGLDisplayBench(s *gpuSuite) {
+	s.glmark2("gl-display-bench", true)
+}
+
+// glmark2 runs glmark2's default scenes on the host's DRM card of the device,
+// in a guest that gives the device its connectors as scanouts, either
+// off-screen or on the display.
+func (s *gpuSuite) glmark2(test string, display bool) {
+	if s.device == "" {
+		fmt.Printf("the %s test needs -device, so it is skipped\n", test)
+		return
+	}
+	if !s.Check(harness.Run("sh", "-c", "command -v glmark2-drm").Code == 0,
+		"glmark2-drm is installed") {
+		return
+	}
+	if !s.Check(harness.Exists(filepath.Join(s.mesa, "lib/gbm")),
+		"the Mesa prefix %s is built", s.mesa) {
+		return
+	}
+	g := s.startGuest("2G", true)
+	if g == nil {
+		return
+	}
+	node := s.attach()
+	if node == "" {
+		return
+	}
+	card := s.card(node)
+	if card == "" {
+		return
+	}
+
+	// The primary planes of virtio-gpu take only XRGB8888, which an EGL
+	// config without alpha renders.
+	args := []string{"--winsys-options", "drm-device=" + card, "--visual-config", "alpha=0"}
+	if display {
+		args = append(args, "--swap-mode", "mailbox")
+	} else {
+		args = append(args, "--off-screen")
+	}
+	before := g.Counters()
+	ctx, cancel := context.WithTimeout(s.ctx, 10*time.Minute)
+	cmd := exec.CommandContext(ctx, "glmark2-drm", args...)
+	cmd.Env = s.mesaEnv()
+	out, err := cmd.CombinedOutput()
+	cancel()
+	os.WriteFile(filepath.Join(s.dir, "glmark2.log"), out, 0644)
+	log := string(out)
+	s.Check(err == nil, "glmark2 finishes%s, see glmark2.log", errSuffix(err))
+	s.Check(glRendererRE.MatchString(log), "glmark2 uses radeonsi")
+	s.Check(!strings.Contains(log, "Error:"), "glmark2 reports no errors, see glmark2.log")
+
+	for _, m := range vkmarkSceneRE.FindAllStringSubmatch(log, -1) {
+		fmt.Printf("%s: %-10s %s: %s FPS, %s ms\n", test, m[1], m[2], m[3], m[4])
+	}
+	m := glmark2ScoreRE.FindStringSubmatch(log)
+	score := 0
+	if m != nil {
+		score, _ = strconv.Atoi(m[1])
+	}
+	s.Check(score > 0, "glmark2 reports a score, %d", score)
+	after := g.Counters()
+	served := after["commands"] - before["commands"]
+	s.Check(served > 1000, "the guest serves glmark2's commands, %d", served)
+	if display {
+		flips := after["flips"] - before["flips"]
+		s.Check(flips > 0, "the guest shows glmark2's frames, %d that the host waited for", flips)
+	}
+	s.checkHostVisible(g, card)
+}
+
+// checkHostVisible checks that virtio_gpu frees every resource of a card once
+// its users exit, and reads the card's host-visible allocations from debugfs
+// into host-visible-mm.log, which then has none. The allocations are read
+// once the guest holds no resources, so that no blob is being freed then.
+func (s *gpuSuite) checkHostVisible(g *harness.Guest, card string) {
+	ok := harness.Wait(func() bool { return g.Counters()["resources"] == 0 }, 5*time.Second, 100*time.Millisecond)
+	s.Check(ok, "virtio_gpu frees its resources, %d left in the guest", g.Counters()["resources"])
+	time.Sleep(200 * time.Millisecond)
+	b, err := os.ReadFile(filepath.Join("/sys/kernel/debug/dri",
+		strings.TrimPrefix(filepath.Base(card), "card"), "virtio-gpu-host-visible-mm"))
+	os.WriteFile(filepath.Join(s.dir, "host-visible-mm.log"), b, 0644)
+	mm := string(b)
+	used := strings.Count(mm, ": used\n")
+	s.Check(err == nil && strings.Contains(mm, "total: ") && used == 0,
+		"virtio_gpu frees the host-visible blobs, %d left, see host-visible-mm.log", used)
 }
