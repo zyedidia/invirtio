@@ -113,6 +113,7 @@ var gpuTests = []gpuTest{
 	{"display-bench", "with -device and a monitor on the iGPU, vkmark renders its scenes on the guest's connector through KMS", gpuTestDisplayBench},
 	{"gl-bench", "with -device and a monitor on the iGPU, glmark2 renders its scenes off-screen through radeonsi", gpuTestGLBench},
 	{"gl-display-bench", "with -device and a monitor on the iGPU, glmark2 renders its scenes through radeonsi on the guest's connector", gpuTestGLDisplayBench},
+	{"teardown", "with -device and a monitor on the iGPU, the device is removed while virtio_gpu frees the host-visible buffers of a process that just exited, and the host's kernel logs no warning", gpuTestTeardown},
 	{"deqp", "with -device, dEQP's synchronization and external memory tests pass through native context", gpuTestDeqp},
 }
 
@@ -1522,6 +1523,69 @@ func gpuTestDisplayBench(s *gpuSuite) {
 			c["flip_commit_us"]/n, c["flip_wait_us"]/n)
 	}
 	s.checkHostVisible(g, card)
+}
+
+// gpuTestTeardown runs testprogs/vk-blobs, which exits with host-visible
+// buffers that it never freed, and removes the device from the vDPA bus as
+// soon as the program exits, while virtio_gpu still frees the buffers. The
+// guest gives the device its connectors as scanouts, and it attaches the
+// device again for each round. After each removal, the host's kernel must
+// not have logged a warning, which it does when a blob still holds its
+// allocation in the host-visible region as the device goes away.
+func gpuTestTeardown(s *gpuSuite) {
+	const rounds, buffers = 10, 512
+	if s.device == "" {
+		fmt.Println("the teardown test needs -device, so it is skipped")
+		return
+	}
+	prog := filepath.Join(harness.RepoRoot(), "build/vk-blobs")
+	if !s.Check(harness.Exists(prog), "%s is built, with make -C testprogs", prog) {
+		return
+	}
+	if !s.Check(harness.Exists(filepath.Join(s.mesa, "lib/libvulkan_radeon.so")),
+		"the Mesa prefix %s is built", s.mesa) {
+		return
+	}
+	g := s.startGuest("2G", true)
+	if g == nil {
+		return
+	}
+	for i := 1; i <= rounds && s.ctx.Err() == nil; i++ {
+		mark := harness.KernelMark()
+		node := s.attach()
+		if node == "" {
+			return
+		}
+		file := fmt.Sprintf("vk-blobs-%d.log", i)
+		ctx, cancel := context.WithTimeout(s.ctx, 2*time.Minute)
+		cmd := exec.CommandContext(ctx, prog, node, strconv.Itoa(buffers))
+		cmd.Env = s.mesaEnv()
+		out, err := cmd.CombinedOutput()
+		cancel()
+		if !s.Check(err == nil, "round %d: vk-blobs maps %d buffers and exits%s, see %s",
+			i, buffers, errSuffix(err), file) {
+			os.WriteFile(filepath.Join(s.dir, file), out, 0644)
+			return
+		}
+		if !s.released() {
+			return
+		}
+		err = harness.Detach(gpuName, false)
+		os.WriteFile(filepath.Join(s.dir, file), out, 0644)
+		if !s.Check(err == nil, "round %d: vdpa dev del removes the device%s", i, errSuffix(err)) {
+			return
+		}
+		warnings := harness.Warnings(harness.KernelLogSince(mark))
+		for _, w := range warnings {
+			fmt.Println("warning: " + w)
+		}
+		if !s.Check(len(warnings) == 0, "round %d: the host's kernel logs no warning as the device is removed", i) {
+			return
+		}
+		if !s.Check(g.Running(), "round %d: the guest keeps running", i) {
+			return
+		}
+	}
 }
 
 var glmark2ScoreRE = regexp.MustCompile(`(?m)^\s*glmark2 Score: (\d+)\s*$`)
