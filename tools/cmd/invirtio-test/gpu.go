@@ -115,6 +115,7 @@ var gpuTests = []gpuTest{
 	{"bandwidth", "with -device, measures the CPU's bandwidth to a host-visible buffer in GTT, or with -vram in visible VRAM", gpuTestBandwidth},
 	{"display", "with -device and a monitor on the iGPU, GPU-rendered frames flip on the guest's connector at its refresh rate, under a moving cursor", gpuTestDisplay},
 	{"dumb", "with -device and a monitor on the iGPU, a dumb buffer and a dumb cursor show on the guest's connector, and the guest copies their damage from the bounce region", gpuTestDumb},
+	{"weston", "with -device and a monitor on the iGPU, weston shows weston-simple-egl on the guest's connector through native context", gpuTestWeston},
 	{"display-bench", "with -device and a monitor on the iGPU, vkmark renders its scenes on the guest's connector through KMS", gpuTestDisplayBench},
 	{"gl-bench", "with -device and a monitor on the iGPU, glmark2 renders its scenes off-screen through radeonsi", gpuTestGLBench},
 	{"gl-display-bench", "with -device and a monitor on the iGPU, glmark2 renders its scenes through radeonsi on the guest's connector", gpuTestGLDisplayBench},
@@ -1463,15 +1464,11 @@ func (s *gpuSuite) console(g *harness.Guest) bool {
 	return s.Check(false, "the guest copies the host's console within 30 s, see console.log")
 }
 
-// hasFB reports whether the device has a framebuffer device, which the host's
-// fbdev client registers on the device's DRM device.
+// hasFB reports whether a framebuffer device of the host's virtio_gpu exists,
+// which DRM's fbdev emulation names after the driver.
 func hasFB() bool {
-	dev, err := filepath.EvalSymlinks(filepath.Join("/sys/bus/vdpa/devices", gpuName))
-	if err != nil {
-		return false
-	}
-	for _, fb := range harness.Glob("/sys/class/graphics/fb*") {
-		if parent, err := filepath.EvalSymlinks(filepath.Join(fb, "device")); err == nil && parent == dev {
+	for _, name := range harness.Glob("/sys/class/graphics/fb*/name") {
+		if harness.Read(name) == "virtio_gpudrmfb" {
 			return true
 		}
 	}
@@ -1681,6 +1678,111 @@ func gpuTestTeardown(s *gpuSuite) {
 			return
 		}
 	}
+}
+
+var simpleEGLRE = regexp.MustCompile(`(?m)^(\d+) frames in (\d+) seconds: ([0-9.]+) fps$`)
+
+// gpuTestWeston runs weston's DRM backend on the host's DRM card of the
+// device, in a guest that gives the device its connectors as scanouts, with
+// weston-simple-egl in full screen on it. Weston and the client render
+// through radeonsi and native context, and the guest flips weston's frames.
+// Weston runs as root with libseat's noop backend, which opens the card and
+// the host's input devices directly, without a session.
+func gpuTestWeston(s *gpuSuite) {
+	const socket = "invirtio-test"
+	if s.device == "" {
+		fmt.Println("the weston test needs -device, so it is skipped")
+		return
+	}
+	for _, prog := range []string{"weston", "weston-simple-egl"} {
+		if !s.Check(harness.Run("sh", "-c", "command -v "+prog).Code == 0, "%s is installed", prog) {
+			return
+		}
+	}
+	g := s.startGuest("2G", true)
+	if g == nil {
+		return
+	}
+	node := s.attach()
+	if node == "" {
+		return
+	}
+	card := s.card(node)
+	if card == "" || !s.console(g) {
+		return
+	}
+
+	rundir, err := os.MkdirTemp("", "invirtio-weston-")
+	if !s.Check(err == nil, "a runtime directory is made%s", errSuffix(err)) {
+		return
+	}
+	defer os.RemoveAll(rundir)
+	env := append(s.mesaEnv(), "XDG_RUNTIME_DIR="+rundir, "LIBSEAT_BACKEND=noop",
+		"WAYLAND_DISPLAY="+socket)
+	start := g.Counters()
+	weston := exec.Command("weston", "--backend=drm", "--drm-device="+filepath.Base(card),
+		"--continue-without-input", "--idle-time=0", "--socket="+socket,
+		"--log="+filepath.Join(s.dir, "weston.log"))
+	weston.Env = env
+	err = weston.Start()
+	if !s.Check(err == nil, "weston starts%s", errSuffix(err)) {
+		return
+	}
+	exited := make(chan error, 1)
+	go func() { exited <- weston.Wait() }()
+	defer func() {
+		weston.Process.Signal(syscall.SIGTERM)
+		select {
+		case err := <-exited:
+			s.Check(err == nil, "weston exits%s, see weston.log", errSuffix(err))
+		case <-time.After(10 * time.Second):
+			weston.Process.Kill()
+			<-exited
+			s.Check(false, "weston exits within 10 s, see weston.log")
+		}
+		s.counters(g)
+	}()
+	// A weston that exits while it starts ends the wait.
+	var westonErr error
+	gone := false
+	ok := harness.Wait(func() bool {
+		select {
+		case westonErr = <-exited:
+			gone = true
+			return true
+		default:
+			return harness.Exists(filepath.Join(rundir, socket))
+		}
+	}, 20*time.Second, 100*time.Millisecond)
+	if gone {
+		exited <- westonErr
+	}
+	if !s.Check(ok && !gone, "weston opens its socket, see weston.log") {
+		return
+	}
+
+	// The client buffers its output and writes it when it exits, which it
+	// does in order on SIGINT.
+	ctx, cancel := context.WithTimeout(s.ctx, 11*time.Second)
+	client := exec.CommandContext(ctx, "weston-simple-egl", "-f")
+	client.Cancel = func() error { return client.Process.Signal(os.Interrupt) }
+	client.WaitDelay = 5 * time.Second
+	client.Env = env
+	out, _ := client.CombinedOutput()
+	cancel()
+	os.WriteFile(filepath.Join(s.dir, "simple-egl.log"), out, 0644)
+	m := simpleEGLRE.FindAllStringSubmatch(string(out), -1)
+	if !s.Check(len(m) > 0, "weston-simple-egl reports its frame rate, see simple-egl.log") {
+		s.blocked(g, "blocked.log")
+		return
+	}
+	fps, _ := strconv.ParseFloat(m[len(m)-1][3], 64)
+	fmt.Printf("weston: weston-simple-egl draws %.1f fps in full screen\n", fps)
+	log, _ := os.ReadFile(filepath.Join(s.dir, "weston.log"))
+	s.Check(bytes.Contains(log, []byte("radeonsi")), "weston renders with radeonsi, see weston.log")
+	c := g.Counters()
+	flips := c["flips"] - start["flips"]
+	s.Check(fps > 30 && flips > 300, "the guest shows weston's frames, %.1f fps and %d flips that the host waited for", fps, flips)
 }
 
 var glmark2ScoreRE = regexp.MustCompile(`(?m)^\s*glmark2 Score: (\d+)\s*$`)
