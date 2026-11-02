@@ -109,6 +109,7 @@ var gpuTests = []gpuTest{
 	{"evict", "with -device, a host-visible buffer keeps its contents across evictions from GTT, or with -vram from VRAM, in the guest", gpuTestEvict},
 	{"pressure", "with -device, host-visible buffers that exceed GTT, or with -vram visible VRAM, keep their contents while the guest evicts them on its own", gpuTestPressure},
 	{"bandwidth", "with -device, measures the CPU's bandwidth to a host-visible buffer in GTT, or with -vram in visible VRAM", gpuTestBandwidth},
+	{"display", "with -device and a monitor on the iGPU, GPU-rendered frames flip on the guest's connector at its refresh rate", gpuTestDisplay},
 	{"deqp", "with -device, dEQP's synchronization and external memory tests pass through native context", gpuTestDeqp},
 }
 
@@ -361,6 +362,13 @@ func (s *gpuSuite) start() *harness.Guest {
 
 // startMem starts a guest as start does, with mem as its memory size.
 func (s *gpuSuite) startMem(mem string) *harness.Guest {
+	return s.startGuest(mem, false)
+}
+
+// startGuest starts a guest as start does, with mem as its memory size, and
+// with display, gives the device the guest's connectors as scanouts. The
+// guest then runs without fbdev emulation, which would set modes of its own.
+func (s *gpuSuite) startGuest(mem string, display bool) *harness.Guest {
 	n := len(s.guests) + 1
 	if s.ctx.Err() != nil {
 		return nil
@@ -372,9 +380,15 @@ func (s *gpuSuite) startMem(mem string) *harness.Guest {
 		LogDir: s.logDir,
 		Args:   []string{"mem=" + mem, "init_shell"},
 	}
+	var opts []string
 	if s.vram {
-		l.Options = "vram"
+		opts = append(opts, "vram")
 	}
+	if display {
+		opts = append(opts, "display")
+		l.Args = append(l.Args, "drm_kms_helper.fbdev_emulation=0")
+	}
+	l.Options = strings.Join(opts, ",")
 	if s.device != "" {
 		l.Devices = []string{s.device}
 	}
@@ -1366,4 +1380,65 @@ func prefetchableWC() (func(), error) {
 			fmt.Printf("warning: cannot restore %s to %s: %v\n", prefetchableWCParam, old, err)
 		}
 	}, nil
+}
+
+var (
+	kmsModeRE = regexp.MustCompile(`(?m)^kms-flip: connector \d+, (\d+)x(\d+)@(\d+)$`)
+	kmsRateRE = regexp.MustCompile(`(?m)^kms-flip: (\d+) flips in ([0-9.]+) s, ([0-9.]+) Hz$`)
+)
+
+// gpuTestDisplay runs testprogs/kms-flip on the host's DRM card of the
+// device, in a guest that gives the device its connectors as scanouts. The
+// program flips frames that radeonsi renders through native context, and
+// the guest shows each on its connector. The host's flush of each frame
+// waits for the flip, so the flips come at the mode's refresh rate, paced by
+// the flips and not by the host's vblank timer.
+func gpuTestDisplay(s *gpuSuite) {
+	const frames = 301
+	if s.device == "" {
+		fmt.Println("the display test needs -device, so it is skipped")
+		return
+	}
+	prog := filepath.Join(harness.RepoRoot(), "build/kms-flip")
+	if !s.Check(harness.Exists(prog), "%s is built, with make -C testprogs", prog) {
+		return
+	}
+	g := s.startGuest("2G", true)
+	if g == nil {
+		return
+	}
+	node := s.attach()
+	if node == "" {
+		return
+	}
+	cards := harness.Glob(filepath.Join("/sys/class/drm", filepath.Base(node), "device/drm/card*"))
+	if !s.Check(len(cards) > 0, "virtio_gpu registers a card next to %s", node) {
+		return
+	}
+	card := "/dev/dri/" + filepath.Base(cards[0])
+
+	before := s.commands(g)
+	flips := g.Counters()["flips"]
+	out := s.runMesa("kms-flip.log", prog, card, strconv.Itoa(frames))
+	mode := kmsModeRE.FindStringSubmatch(out)
+	rate := kmsRateRE.FindStringSubmatch(out)
+	if !s.Check(mode != nil && rate != nil, "kms-flip flips %d frames, see kms-flip.log", frames-1) {
+		return
+	}
+	refresh, _ := strconv.ParseFloat(mode[3], 64)
+	hz, _ := strconv.ParseFloat(rate[3], 64)
+	fmt.Printf("display: %sx%s@%s, %s Hz\n", mode[1], mode[2], mode[3], rate[3])
+	s.Check(refresh > 0 && hz > refresh*0.9 && hz < refresh*1.1,
+		"the flips come at the mode's refresh rate, %.1f Hz for %.0f Hz", hz, refresh)
+	s.Check(before >= 0 && s.commands(g) > before, "the guest serves the program's commands")
+	c := g.Counters()
+	if n := c["flips_timed"]; n > 0 {
+		fmt.Printf("display: in the guest, a flip's commit takes %d us and its flip comes %d us after its command\n",
+			c["flip_commit_us"]/n, c["flip_wait_us"]/n)
+	}
+	flipped := c["flips"] - flips
+	s.Check(flipped >= frames-1, "the host's flushes wait for the guest's flips, %d of %d", flipped, frames-1)
+	// The host's fbdev client sets up its console with a 2D resource, which
+	// the device refuses.
+	fmt.Printf("display: the guest refused %d commands\n", g.Counters()["invalid_commands"])
 }
