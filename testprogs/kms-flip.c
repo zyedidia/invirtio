@@ -5,15 +5,18 @@
  * is a scanout buffer of a GBM surface that GLES clears to a new color, and
  * the program waits for each flip's event before it renders the next frame.
  * It also reports how long rendering and flipping took on average, and how
- * many refresh periods lay between the flips by the events' timestamps.
+ * many refresh periods lay between the flips by the events' timestamps. With
+ * cursor, a 64x64 GBM cursor, a white square with a black border, moves
+ * across the display by one step for each frame.
  *
- * usage: kms-flip <card> <frames>
+ * usage: kms-flip <card> <frames> [cursor]
  */
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -107,10 +110,13 @@ int main(int argc, char **argv)
 	double start, t, frame, render = 0, flip = 0, last = 0, period;
 	unsigned int periods[4] = { 0 };
 	struct flip f;
+	struct gbm_bo *cursor = NULL;
+	int with_cursor;
 
 	setvbuf(stdout, NULL, _IOLBF, 0);
-	if (argc != 3 || (frames = atoi(argv[2])) < 2) {
-		fprintf(stderr, "usage: %s <card> <frames>\n", prog);
+	with_cursor = argc == 4 && !strcmp(argv[3], "cursor");
+	if ((argc != 3 && !with_cursor) || (frames = atoi(argv[2])) < 2) {
+		fprintf(stderr, "usage: %s <card> <frames> [cursor]\n", prog);
 		return 2;
 	}
 	fd = open(argv[1], O_RDWR | O_CLOEXEC);
@@ -191,6 +197,36 @@ int main(int argc, char **argv)
 		die("cannot make an EGL context current");
 	printf("%s: GL renderer %s\n", prog, glGetString(GL_RENDERER));
 
+	/*
+	 * A linear cursor of the GPU's driver, which virtio-gpu shares as a
+	 * blob, written through a mapping. Virtio-gpu cursors have rows of 64
+	 * pixels. On a GPU with VRAM of its own, radeonsi would write the
+	 * cursor through a staging copy, which this program never flushes.
+	 */
+	if (with_cursor) {
+		uint32_t stride, *pixels;
+		void *map_data = NULL;
+		int x, y;
+
+		cursor = gbm_bo_create(gbm, 64, 64, GBM_FORMAT_ARGB8888,
+				       GBM_BO_USE_CURSOR | GBM_BO_USE_LINEAR);
+		if (!cursor)
+			die("cannot create the cursor");
+		pixels = gbm_bo_map(cursor, 0, 0, 64, 64,
+				    GBM_BO_TRANSFER_WRITE, &stride, &map_data);
+		if (!pixels || stride != 64 * 4)
+			die("cannot map the cursor with rows of 64 pixels");
+		for (y = 0; y < 64; y++) {
+			for (x = 0; x < 64; x++) {
+				int edge = x < 4 || x >= 60 || y < 4 || y >= 60;
+
+				pixels[y * 64 + x] = edge ? 0xff000000 :
+							    0xffffffff;
+			}
+		}
+		gbm_bo_unmap(cursor, map_data);
+	}
+
 	start = 0;
 	period = 1.0 / mode->vrefresh;
 	for (i = 0; i < frames; i++) {
@@ -208,10 +244,20 @@ int main(int argc, char **argv)
 			if (drmModeSetCrtc(fd, crtc, bo_fb(fd, bo), 0, 0,
 					   &conn->connector_id, 1, mode))
 				die("drmModeSetCrtc failed");
+			if (cursor &&
+			    drmModeSetCursor2(fd, crtc,
+					      gbm_bo_get_handle(cursor).u32,
+					      64, 64, 0, 0))
+				die("drmModeSetCursor2 failed");
 			start = now();
 		} else {
 			t = now();
 			render += t - frame;
+			if (cursor &&
+			    drmModeMoveCursor(fd, crtc,
+					      (i * 8) % (mode->hdisplay - 64),
+					      (i * 4) % (mode->vdisplay - 64)))
+				die("drmModeMoveCursor failed");
 			f.pending = 1;
 			if (drmModePageFlip(fd, crtc, bo_fb(fd, bo),
 					    DRM_MODE_PAGE_FLIP_EVENT, &f))
