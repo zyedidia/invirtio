@@ -5,6 +5,7 @@
 #                 drivers and VDUSE backends of the WiFi and Ethernet
 #                 guests, and the WiFi firmware. invirtio picks the backend
 #                 for each device when it starts the device's guest.
+#                 invirtio-test bench-net and bench-wlan run it.
 #   blk-test      the guest that invirtio-test test-blk runs under the
 #                 launcher, which serves a ramdisk.
 #   blk-test-ubd  the guest that invirtio-test test-blk runs without the
@@ -13,8 +14,6 @@
 #                 without the sandbox, which serves its own null_blk.
 #   net-test      the guest that invirtio-test test-net runs, which exports
 #                 one end of a veth pair, or a port of the X710 or I226-V.
-#   net-bench     the guest that invirtio-test bench-net runs, which
-#                 exports a port of the X710.
 #   wlan-test     the guest that invirtio-test test-wlan runs, which exports
 #                 a mac80211_hwsim radio and runs access points on three
 #                 others.
@@ -44,7 +43,7 @@ TARGET=invirtio
 while getopts t:h opt; do
     case $opt in
     t) TARGET=$OPTARG ;;
-    *) sed -n '2,32s/^# \{0,1\}//p' "$0" >&2; exit 2 ;;
+    *) sed -n '2,31s/^# \{0,1\}//p' "$0" >&2; exit 2 ;;
     esac
 done
 shift $((OPTIND - 1))
@@ -70,10 +69,6 @@ net-test)
     FRAGMENTS=(driver-guest net-guest net-test lockdep)
     INITRAMFS=(-i "$ROOT/scripts/net-test-init" -b "$(command -v iperf3)"
                -b "$(command -v ip)")
-    ;;
-net-bench)
-    FRAGMENTS=(driver-guest net-guest)
-    INITRAMFS=()
     ;;
 wlan-test)
     FRAGMENTS=(driver-guest wlan-guest wlan-hwsim lockdep)

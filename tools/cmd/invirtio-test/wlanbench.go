@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -10,10 +9,13 @@ import (
 	"os/signal"
 	"path/filepath"
 	"regexp"
+	"slices"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
+	"invirtio/internal/bench"
 	"invirtio/internal/harness"
 	"invirtio/internal/pci"
 	"invirtio/internal/vdpa"
@@ -30,6 +32,17 @@ const (
 	wlanBenchPort = 5299
 )
 
+var wlanBenchTargets = []string{"native", "guest"}
+
+var wlanBenchJobs = []bench.Job{
+	{Name: "scan", About: "a scan with iw, before joining", Metrics: []string{"seconds", "bss"}},
+	{Name: "connect", About: "from the start of wpa_supplicant until it completes the connection", Metrics: []string{"seconds"}},
+	{Name: "upload", About: "iperf3 TCP to the server", Metrics: []string{"mbps", "retransmits"}},
+	{Name: "download", About: "iperf3 TCP from the server", Metrics: []string{"mbps", "retransmits"}},
+	{Name: "ping-idle", About: "50 pings of the server at 200 ms on an idle link", Metrics: []string{"avg_ms", "max_ms", "mdev_ms", "loss_pct"}},
+	{Name: "ping-load", About: "pings of the server at 200 ms during a download", Metrics: []string{"avg_ms", "max_ms", "mdev_ms", "loss_pct"}},
+}
+
 // wlanBenchUdhcpc is the script of the DHCP client in the namespace, which
 // adds the address and a default route.
 const wlanBenchUdhcpc = `#!/bin/sh
@@ -43,33 +56,6 @@ esac
 exit 0
 `
 
-// WlanBenchRun is one iperf3 run, an upload to the server or a download
-// from it.
-type WlanBenchRun struct {
-	Dir         string  `json:"dir"`
-	Rep         int     `json:"rep"`
-	Mbps        float64 `json:"mbps"`
-	Retransmits int64   `json:"retransmits"`
-	HostCPUs    float64 `json:"host_cpus"`
-	UMLCPUs     float64 `json:"uml_cpus,omitempty"`
-}
-
-type WlanBenchTarget struct {
-	Name string            `json:"name"`
-	Link map[string]string `json:"link"`
-	Runs []WlanBenchRun    `json:"runs"`
-	// The round trips to the server, idle and during a download.
-	PingIdle   harness.Ping `json:"ping_idle"`
-	PingLoaded harness.Ping `json:"ping_loaded"`
-	// The guest's memory over the target's runs.
-	Memory *harness.GuestMemory `json:"memory,omitempty"`
-}
-
-type WlanBenchResults struct {
-	Host    map[string]string `json:"host"`
-	Targets []WlanBenchTarget `json:"targets"`
-}
-
 type wlanBenchSuite struct {
 	out      string
 	build    string
@@ -77,12 +63,19 @@ type wlanBenchSuite struct {
 	conf     string
 	server   string
 	noServer bool
-	reps     int
-	seconds  int
-	mem      string
-	results  WlanBenchResults
-	// The guest of the guest target, whose memory is sampled between runs.
+	// hostDriver is the card's host driver, and unbindNative allows the
+	// benchmark to unbind it.
+	hostDriver   string
+	unbindNative bool
+	seconds      int
+	omit         int
+	mem          string
+	opts         *bench.Options
+	results      bench.Results
+	// The guest of the guest target and its cgroup, whose memory is
+	// sampled between runs and whose CPU use is measured.
 	guest  *harness.Guest
+	cgroup string
 	memory *harness.GuestMemory
 	// ctx ends on a signal, which stops a running iperf3, and the target
 	// that runs then fails and cleans up.
@@ -94,48 +87,70 @@ func cmdBenchWlan(args []string) error {
 	fs := newFlags("bench-wlan", `
 usage: invirtio-test bench-wlan [options] -conf <wpa_supplicant.conf> -server <address> [<target>...]
 
-Measure a WiFi card's throughput and latency against an iperf3 server that
-is reached through the access point. Each target is one of:
+Measure a WiFi card's throughput, latency, scan and connection time against
+an iperf3 server that is reached through the access point. Each target is
+one of:
   native   the card on its host driver
   guest    the card driven by the invirtio guest under the launcher and
            exported to the host's virtio_wlan
 
-The default runs both. For each, the interface is taken from
-NetworkManager and the system wpa_supplicant, and its wiphy moves into the
-network namespace wlan-bench, so that traffic to a server on this host
-crosses the radio instead of being delivered locally. There it joins the
-network of -conf with wpa_supplicant and gets a lease with busybox udhcpc.
-The server is one of this host's addresses on the access point's uplink,
-where bench-wlan runs an iperf3 server on port 5299 unless -no-server is
-given, or a host behind the access point that runs one. Each target runs
-iperf3 TCP to the server and from it, -reps times for -time seconds, and
-pings the server idle and during one more download. A run's CPU use is how
-many of the host's CPUs were busy, and with the guest, how many its UML
-process took. The guest runs with -mem in a cgroup of its own, as
-invirtio's guests do, and the results record the cgroup's peak memory and
-the most memory that the guest itself used between runs. The card must not
-be in use, so stop its invirtio service
-first, and it is returned to its driver afterwards. Build the guest with
-scripts/invirtio-build-guest.sh. The output directory gets results.json
-and the summary, which bench-wlan-summary prints again, and the logs. Run
-as root on the linux-host kernel, with iw, wpa_supplicant, iperf3 and
-busybox.`)
+The default runs both. Each round brings up every target once, and every
+other round runs the targets in the reverse order. Removing mt7921e hangs
+the 7.2-rc host, which also blacklists it, so by default bench-wlan loads
+the host driver itself, runs every native round after all the guest
+rounds, and never unbinds the host driver. The card then stays on it, and
+giving the card back to its guest takes a reboot. With -unbind-native, the
+targets interleave and the card returns to its earlier driver.
+
+For each target, the interface is taken from NetworkManager and the system
+wpa_supplicant, and its wiphy moves into the network namespace wlan-bench,
+so that traffic to a server on this host crosses the radio instead of being
+delivered locally. There power save is turned off, the card scans once
+with iw, and it joins the network of -conf with wpa_supplicant and gets a
+lease with busybox udhcpc. The server is one of this host's addresses on
+the access point's uplink, where bench-wlan runs an iperf3 server on port
+5299 unless -no-server is given, or a host behind the access point that
+runs one. Each round then runs the jobs -reps times, each iperf3 run for
+-time seconds after -omit seconds that it leaves out.
+
+The benchmark's programs run on -app-cpus, and the iperf3 server on
+-peer-cpus. The card's interrupts and the guest's CPU, its helper threads
+and its VDUSE interrupts go to -device-cpu. Each run records how many of the
+host's CPUs were busy and how many of each set's, and with the guest, how
+many CPUs the guest's cgroup took. During the run, every CPU uses the
+performance governor, boost is as -boost says, and irqbalance is stopped.
+
+The guest runs with -mem in a cgroup of its own, as invirtio's guests do,
+and the results record the cgroup's peak memory and the most memory that
+the guest itself used between runs. The card must not be in use, so stop
+its invirtio service first. Afterwards the card returns to its earlier
+driver, except that without -unbind-native it stays on a host driver that
+a native round bound, and its invirtio service must then not start before
+a reboot. Build the guest with scripts/invirtio-build-guest.sh. The output directory
+gets results.json, runs.csv with one metric of one run on each line, the
+summary, which bench-wlan-summary prints again, and the logs. Run as root on
+the linux-host kernel, with iw, wpa_supplicant, iperf3 and busybox.
+
+Jobs:`+wlanBenchJobList())
 	build := fs.String("guest", filepath.Join(root, "linux-uml/build-invirtio"), "the build directory of the guest")
 	out := fs.String("out", filepath.Join(root, "build/bench-wlan"), "the output directory")
 	card := fs.String("device", "0000:06:00.0", "the PCI address of the card")
 	conf := fs.String("conf", "", "the wpa_supplicant configuration of the network")
 	server := fs.String("server", "", "the address of the iperf3 server")
 	noServer := fs.Bool("no-server", false, "use an iperf3 server that already runs")
-	reps := fs.Int("reps", 3, "the repetitions of each direction")
-	seconds := fs.Int("time", 10, "the seconds that each iperf3 run takes")
+	seconds := fs.Int("time", 10, "the seconds that each iperf3 run measures")
+	omit := fs.Int("omit", 2, "the seconds at the start of each iperf3 run that it leaves out")
 	mem := fs.String("mem", "256M", "the guest's memory, as UML's mem= takes it")
+	hostDriver := fs.String("host-driver", "mt7921e", "the card's host driver, which is loaded for the native target")
+	unbindNative := fs.Bool("unbind-native", false, "allow unbinding the host driver, so that native and guest rounds interleave")
+	opts := bench.AddFlags(fs, 5, 2)
 	fs.Parse(args)
 	targets := fs.Args()
 	if len(targets) == 0 {
-		targets = []string{"native", "guest"}
+		targets = wlanBenchTargets
 	}
 	for _, t := range targets {
-		if t != "native" && t != "guest" {
+		if !slices.Contains(wlanBenchTargets, t) {
 			fs.Usage()
 			os.Exit(2)
 		}
@@ -144,10 +159,14 @@ busybox.`)
 		fs.Usage()
 		os.Exit(2)
 	}
+	if err := opts.Check(); err != nil {
+		return err
+	}
 	requireRoot()
 
 	s := &wlanBenchSuite{build: *build, conf: *conf, server: *server, noServer: *noServer, mem: *mem,
-		reps: *reps, seconds: *seconds}
+		hostDriver: *hostDriver, unbindNative: *unbindNative,
+		seconds: *seconds, omit: *omit, opts: opts}
 	var err error
 	if s.card, err = pci.NormalizeAddress(*card); err != nil {
 		return err
@@ -161,7 +180,7 @@ busybox.`)
 	if err := harness.TeeOutput(filepath.Join(s.out, "bench.log")); err != nil {
 		return err
 	}
-	for _, tool := range []string{"iw", "wpa_supplicant", "wpa_cli", "iperf3", "busybox", "vdpa", "ping"} {
+	for _, tool := range []string{"iw", "wpa_supplicant", "wpa_cli", "iperf3", "busybox", "vdpa", "ping", "taskset", "ethtool"} {
 		if harness.Run("sh", "-c", "command -v "+tool).Code != 0 {
 			return fmt.Errorf("%s is not installed", tool)
 		}
@@ -175,22 +194,23 @@ busybox.`)
 	if pids := harness.PCIHolders(s.card); len(pids) > 0 {
 		return fmt.Errorf("%s is in use by process %d, stop its guest first", s.card, pids[0])
 	}
-	s.results.Host = map[string]string{
-		"uname":  strings.TrimSpace(harness.Run("uname", "-a").Stdout),
-		"card":   strings.TrimSpace(harness.Run("lspci", "-s", s.card).Stdout),
-		"server": s.server,
-		"reps":   fmt.Sprint(s.reps),
-		"time":   fmt.Sprint(s.seconds),
-	}
 	if err := os.WriteFile(filepath.Join(s.out, "udhcpc.sh"), []byte(wlanBenchUdhcpc), 0755); err != nil {
 		return err
 	}
 
-	// The card goes back to the driver it had.
+	// The card goes back to the driver it had, unless that means unbinding
+	// a host driver.
 	before := harness.PCIDriver(s.card)
+	if hostBound(before) && !s.unbindNative && slices.Contains(targets, "guest") {
+		return fmt.Errorf("%s is on %s, which the guest target would have to unbind, so reboot first or give -unbind-native", s.card, before)
+	}
 	defer func() {
 		harness.Cleanup(wlanBenchName)
 		if harness.PCIDriver(s.card) == before {
+			return
+		}
+		if d := harness.PCIDriver(s.card); hostBound(d) && !s.unbindNative {
+			fmt.Printf("%s stays on %s. Do not start its invirtio service before a reboot, which gives the card back to its guest.\n", s.card, d)
 			return
 		}
 		if before == "vfio-pci" {
@@ -203,29 +223,82 @@ busybox.`)
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
 	defer cancel()
 	s.ctx = ctx
-	for _, name := range targets {
+	tuning, err := opts.Tune()
+	if err != nil {
+		return err
+	}
+	defer tuning.Restore()
+	s.results.Env = s.env()
+	s.results.Targets = targets
+	// Without -unbind-native, the native rounds come after all the others,
+	// so that the host driver, whose removal can hang, is never unbound.
+	type slot struct {
+		round  int
+		target string
+	}
+	var others []string
+	for _, t := range targets {
+		if t != "native" || s.unbindNative {
+			others = append(others, t)
+		}
+	}
+	var schedule []slot
+	for round := 1; round <= opts.Rounds; round++ {
+		for _, t := range bench.Order(others, round) {
+			schedule = append(schedule, slot{round, t})
+		}
+	}
+	if len(others) < len(targets) {
+		for round := 1; round <= opts.Rounds; round++ {
+			schedule = append(schedule, slot{round, "native"})
+		}
+	}
+	for _, sl := range schedule {
 		if ctx.Err() != nil {
 			return errors.New("stopped by a signal")
 		}
-		fmt.Printf("== %s\n", name)
-		t := WlanBenchTarget{Name: name}
-		if name == "native" {
-			err = s.runNative(&t)
+		fmt.Printf("== round %d: %s\n", sl.round, sl.target)
+		in := bench.Instance{Target: sl.target, Round: sl.round}
+		if sl.target == "native" {
+			err = s.runNative(&in)
 		} else {
-			err = s.runGuest(&t)
+			err = s.runGuest(&in)
 		}
 		if err != nil {
-			return fmt.Errorf("%s: %v", name, err)
+			return fmt.Errorf("round %d: %s: %v", sl.round, sl.target, err)
 		}
-		s.results.Targets = append(s.results.Targets, t)
-		data, _ := json.MarshalIndent(&s.results, "", "  ")
-		if err := os.WriteFile(filepath.Join(s.out, "results.json"), append(data, '\n'), 0644); err != nil {
+		s.results.Instances = append(s.results.Instances, in)
+		if err := s.results.Save(s.out); err != nil {
 			return err
 		}
 	}
 	summary := wlanBenchSummary(&s.results)
 	fmt.Print(summary)
 	return os.WriteFile(filepath.Join(s.out, "summary.txt"), []byte(summary), 0644)
+}
+
+func wlanBenchJobList() string {
+	var b strings.Builder
+	for _, j := range wlanBenchJobs {
+		fmt.Fprintf(&b, "\n  %-10s %s", j.Name, j.About)
+	}
+	return b.String()
+}
+
+func (s *wlanBenchSuite) env() map[string]string {
+	env := bench.Environment()
+	for k, v := range s.opts.Describe() {
+		env[k] = v
+	}
+	env["card"] = strings.TrimSpace(harness.Run("lspci", "-s", s.card).Stdout)
+	env["server"] = s.server
+	env["time"] = strconv.Itoa(s.seconds)
+	env["omit"] = strconv.Itoa(s.omit)
+	env["mem"] = s.mem
+	env["guest_build"] = s.build
+	env["iperf3"] = strings.SplitN(harness.Run("iperf3", "--version").Stdout, "\n", 2)[0]
+	env["wpa_supplicant"] = strings.TrimSpace(harness.Run("wpa_supplicant", "-v").Stdout)
+	return env
 }
 
 // wiphy waits for a wiphy and an interface under a device directory, and
@@ -247,31 +320,51 @@ func wiphy(dir string) (phy, net string) {
 	return phy, net
 }
 
-func (s *wlanBenchSuite) runNative(t *WlanBenchTarget) error {
-	if err := pci.BindNative(s.card); err != nil {
+// hostBound reports whether a driver is one of the host's own, which
+// bench-wlan unbinds only with -unbind-native.
+func hostBound(driver string) bool {
+	return driver != "" && driver != "vfio-pci"
+}
+
+// runNative brings the card up on its host driver. Without -unbind-native,
+// a card that the driver already has stays bound.
+func (s *wlanBenchSuite) runNative(in *bench.Instance) error {
+	if err := harness.Modprobe(s.hostDriver); err != nil {
 		return err
+	}
+	if !hostBound(harness.PCIDriver(s.card)) || s.unbindNative {
+		if err := pci.BindNative(s.card); err != nil {
+			return err
+		}
 	}
 	phy, net := wiphy(pci.Path(s.card, ""))
 	if net == "" {
 		return fmt.Errorf("%s's driver %q made no wiphy", s.card, harness.PCIDriver(s.card))
 	}
-	return s.measure(t, phy, net, 0)
+	if s.opts.DeviceCPU != "" {
+		restore, err := bench.SteerIRQs(s.card, s.opts.DeviceCPU)
+		if err != nil {
+			return err
+		}
+		defer restore()
+	}
+	return s.measure(in, phy, net)
 }
 
-func (s *wlanBenchSuite) runGuest(t *WlanBenchTarget) error {
+func (s *wlanBenchSuite) runGuest(in *bench.Instance) error {
 	logDir, err := harness.MakeLogDir(wlanBenchName)
 	if err != nil {
 		return err
 	}
 	defer os.RemoveAll(logDir)
 	// The guest runs in a cgroup of its own, as invirtio's guests do, which
-	// records its peak memory.
+	// records its peak memory and its CPU time.
 	cg, err := harness.MakeCgroup(wlanBenchName)
 	if err != nil {
 		return err
 	}
 	defer harness.RemoveCgroup(cg)
-	g, err := harness.LaunchGuest(filepath.Join(s.out, "guest.log"), harness.Launch{
+	l := harness.Launch{
 		Build:   s.build,
 		Type:    "wlan",
 		Name:    wlanBenchName,
@@ -279,7 +372,12 @@ func (s *wlanBenchSuite) runGuest(t *WlanBenchTarget) error {
 		Devices: []string{s.card},
 		Args:    []string{"mem=" + s.mem},
 		Cgroup:  cg,
-	})
+		IRQCPUs: s.opts.DeviceCPU,
+	}
+	if s.opts.DeviceCPU != "" {
+		l.Args = append(l.Args, "cpu_pin="+s.opts.DeviceCPU)
+	}
+	g, err := harness.LaunchGuest(filepath.Join(s.out, fmt.Sprintf("guest-%d.log", in.Round)), l)
 	if err != nil {
 		return err
 	}
@@ -288,10 +386,10 @@ func (s *wlanBenchSuite) runGuest(t *WlanBenchTarget) error {
 		g.Stop(30 * time.Second)
 		g.Kill()
 		harness.Cleanup(wlanBenchName)
-		s.guest, s.memory = nil, nil
+		s.guest, s.cgroup, s.memory = nil, "", nil
 	}()
 	if !g.WaitFor(wlanBenchName+": created", 2*time.Minute) {
-		return errors.New("the guest did not create its device, see guest.log")
+		return errors.New("the guest did not create its device, see " + g.Path)
 	}
 	if err := harness.Attach(wlanBenchName); err != nil {
 		return err
@@ -304,30 +402,40 @@ func (s *wlanBenchSuite) runGuest(t *WlanBenchTarget) error {
 	if net == "" {
 		return errors.New("virtio_wlan made no wiphy")
 	}
-	uml := harness.UMLPid(g.Pid())
-	if uml == 0 {
-		return errors.New("cannot find the guest's UML process")
+	cpu := -1
+	if s.opts.DeviceCPU != "" {
+		cpu, _ = strconv.Atoi(s.opts.DeviceCPU)
 	}
-	s.guest, s.memory = g, &harness.GuestMemory{Mem: s.mem}
-	s.memory.SampleGuest(g.Output("cat /proc/meminfo", 10*time.Second))
-	if err := s.measure(t, phy, net, uml); err != nil {
+	if err := harness.PlaceIRQs(wlanBenchName, cpu); err != nil {
 		return err
 	}
+	s.guest, s.cgroup = g, cg
+	s.memory = &harness.GuestMemory{Mem: s.mem}
+	s.memory.SampleGuest(g.Output("cat /proc/meminfo", 10*time.Second))
+	if err := s.measure(in, phy, net); err != nil {
+		return err
+	}
+	in.Counters = g.Counters()
 	s.memory.SampleGuest(g.Output("cat /proc/meminfo", 10*time.Second))
 	if err := s.memory.ReadCgroup(cg); err != nil {
 		return err
 	}
-	t.Memory = s.memory
-	fmt.Println("  memory: " + t.Memory.Summary())
+	in.Memory = s.memory
+	fmt.Println("  memory: " + in.Memory.Summary())
 	return nil
 }
 
-// measure joins the network in the namespace and runs the iperf3 runs and
-// pings. uml is the guest's UML process, or 0.
-func (s *wlanBenchSuite) measure(t *WlanBenchTarget, phy, net string, uml int) error {
-	dir := filepath.Join(s.out, t.Name)
+var (
+	wlanBSSRE       = regexp.MustCompile(`(?m)^BSS `)
+	wlanPowerSaveRE = regexp.MustCompile(`Power save: (\w+)`)
+)
+
+// measure joins the network in the namespace and runs the jobs.
+func (s *wlanBenchSuite) measure(in *bench.Instance, phy, net string) error {
+	dir := filepath.Join(s.out, fmt.Sprintf("%s-%d", in.Target, in.Round))
 	os.MkdirAll(dir, 0755)
 	ns := func(argv ...string) []string { return harness.InNS(wlanBenchNS, argv...) }
+	app := func(argv ...string) []string { return ns(bench.Pin(s.opts.AppCPUs, argv...)...) }
 	harness.Release(net)
 	// A new wiphy starts blocked while the host's WiFi is switched off.
 	softs, _ := filepath.Glob(filepath.Join("/sys/class/ieee80211", phy, "rfkill*/soft"))
@@ -345,6 +453,7 @@ func (s *wlanBenchSuite) measure(t *WlanBenchTarget, phy, net string, uml int) e
 		{"iw", "phy", phy, "set", "netns", "name", wlanBenchNS},
 		ns("ip", "link", "set", "lo", "up"),
 		ns("ip", "link", "set", net, "up"),
+		ns("iw", "dev", net, "set", "power_save", "off"),
 	} {
 		if err := harness.MustRun(argv[0], argv[1:]...); err != nil {
 			return err
@@ -373,11 +482,49 @@ func (s *wlanBenchSuite) measure(t *WlanBenchTarget, phy, net string, uml int) e
 		}
 	}
 	if !s.noServer {
-		server, err := start("iperf3-server.log", "iperf3", "-s", "-B", s.server, "-p", fmt.Sprint(wlanBenchPort))
+		argv := bench.Pin(s.opts.PeerCPUs, "iperf3", "-s", "-B", s.server, "-p", fmt.Sprint(wlanBenchPort))
+		server, err := start("iperf3-server.log", argv...)
 		if err != nil {
 			return err
 		}
 		defer stop(server)
+	}
+
+	// record runs one repetition of a job with its CPU use.
+	record := func(job string, rep int, run func() (map[string]float64, error)) error {
+		if s.ctx.Err() != nil {
+			return errors.New("stopped by a signal")
+		}
+		meter := bench.StartMeter(s.opts.Sets(), s.cgroup)
+		m, err := run()
+		cpu := meter.Stop()
+		if err != nil {
+			return fmt.Errorf("%s: %v", job, err)
+		}
+		for k, v := range cpu {
+			m[k] = v
+		}
+		j := wlanBenchJobs[slices.IndexFunc(wlanBenchJobs, func(j bench.Job) bool { return j.Name == job })]
+		fmt.Printf("  %s %d: %s\n", job, rep, bench.Format(j, m))
+		s.results.Runs = append(s.results.Runs, bench.Run{Job: job, Target: in.Target, Round: in.Round, Rep: rep, Metrics: m})
+		if s.guest != nil {
+			s.memory.SampleGuest(s.guest.Output("cat /proc/meminfo", 10*time.Second))
+		}
+		return nil
+	}
+
+	err := record("scan", 1, func() (map[string]float64, error) {
+		argv := app("iw", "dev", net, "scan")
+		t0 := time.Now()
+		r := harness.RunContext(s.ctx, dir, time.Minute, argv[0], argv[1:]...)
+		elapsed := time.Since(t0).Seconds()
+		if !r.OK() {
+			return nil, fmt.Errorf("iw scan: %s", strings.TrimSpace(r.Output()))
+		}
+		return map[string]float64{"seconds": elapsed, "bss": float64(len(wlanBSSRE.FindAllString(r.Stdout, -1)))}, nil
+	})
+	if err != nil {
+		return err
 	}
 
 	// The configuration gets a control interface of the test's own, which
@@ -392,43 +539,60 @@ func (s *wlanBenchSuite) measure(t *WlanBenchTarget, phy, net string, uml int) e
 	if err := os.WriteFile(conf, []byte(text), 0600); err != nil {
 		return err
 	}
-	wpa, err := start("wpa_supplicant.log", ns("wpa_supplicant", "-i", net, "-D", "nl80211", "-c", conf)...)
+	var wpa *exec.Cmd
+	err = record("connect", 1, func() (map[string]float64, error) {
+		t0 := time.Now()
+		var err error
+		if wpa, err = start("wpa_supplicant.log", app("wpa_supplicant", "-i", net, "-D", "nl80211", "-c", conf)...); err != nil {
+			wpa = nil
+			return nil, err
+		}
+		joined := harness.Wait(func() bool {
+			return strings.Contains(harness.RunArgv(app("wpa_cli", "-p", ctrl, "-i", net, "status")).Stdout, "wpa_state=COMPLETED")
+		}, 30*time.Second, 20*time.Millisecond)
+		if !joined {
+			return nil, fmt.Errorf("wpa_supplicant did not join the network, see %s", filepath.Join(dir, "wpa_supplicant.log"))
+		}
+		return map[string]float64{"seconds": time.Since(t0).Seconds()}, nil
+	})
+	if wpa != nil {
+		defer stop(wpa)
+	}
 	if err != nil {
 		return err
 	}
-	defer stop(wpa)
-	joined := harness.Wait(func() bool {
-		return strings.Contains(harness.RunArgv(ns("wpa_cli", "-p", ctrl, "-i", net, "status")).Stdout, "wpa_state=COMPLETED")
-	}, 30*time.Second, 200*time.Millisecond)
-	if !joined {
-		return fmt.Errorf("wpa_supplicant did not join the network, see %s", filepath.Join(dir, "wpa_supplicant.log"))
+	ps := wlanPowerSaveRE.FindStringSubmatch(harness.RunArgv(ns("iw", "dev", net, "get", "power_save")).Stdout)
+	if ps == nil || ps[1] != "off" {
+		return fmt.Errorf("power save is not off on %s", net)
 	}
 	r := harness.RunArgv(ns("busybox", "udhcpc", "-i", net, "-f", "-n", "-q", "-t", "5", "-T", "2",
 		"-s", filepath.Join(s.out, "udhcpc.sh")))
 	if !r.OK() {
 		return fmt.Errorf("no DHCP lease: %s", strings.TrimSpace(r.Output()))
 	}
-	t.Link = map[string]string{}
-	for _, line := range strings.Split(harness.RunArgv(ns("iw", "dev", net, "link")).Stdout, "\n") {
+	in.Info = map[string]string{
+		"iw link":    strings.TrimSpace(harness.RunArgv(ns("iw", "dev", net, "link")).Stdout),
+		"power_save": ps[1],
+		"ethtool -i": strings.TrimSpace(harness.RunArgv(ns("ethtool", "-i", net)).Stdout),
+	}
+	for _, line := range strings.Split(in.Info["iw link"], "\n") {
 		if k, v, ok := strings.Cut(strings.TrimSpace(line), ": "); ok {
-			t.Link[k] = v
+			in.Info["link "+k] = v
 		}
 	}
 
-	ping := func(count int) (harness.Ping, error) {
-		argv := ns("ping", "-q", "-c", fmt.Sprint(count), "-i", "0.2", "-W", "2", s.server)
+	ping := func(count int) (map[string]float64, error) {
+		argv := app("ping", "-q", "-c", fmt.Sprint(count), "-i", "0.2", "-W", "2", s.server)
 		r := harness.RunContext(s.ctx, dir, time.Duration(count)*time.Second+time.Minute, argv[0], argv[1:]...)
 		p, ok := harness.ParsePing(r.Output())
 		if !ok {
-			return p, fmt.Errorf("ping printed %q", strings.TrimSpace(r.Output()))
+			return nil, fmt.Errorf("ping printed %q", strings.TrimSpace(r.Output()))
 		}
-		return p, nil
+		return map[string]float64{"avg_ms": p.Avg, "max_ms": p.Max, "mdev_ms": p.Mdev, "loss_pct": p.Loss}, nil
 	}
-	if t.PingIdle, err = ping(50); err != nil {
-		return err
-	}
-	iperf := func(ctx context.Context, reverse bool) (harness.Iperf, error) {
-		argv := ns("iperf3", "-c", s.server, "-p", fmt.Sprint(wlanBenchPort), "-t", fmt.Sprint(s.seconds), "-J")
+	iperf := func(ctx context.Context, reverse bool) (map[string]float64, error) {
+		argv := app("iperf3", "-c", s.server, "-p", fmt.Sprint(wlanBenchPort), "-t", fmt.Sprint(s.seconds),
+			"-O", fmt.Sprint(s.omit), "-J")
 		if reverse {
 			argv = append(argv, "-R")
 		}
@@ -436,49 +600,46 @@ func (s *wlanBenchSuite) measure(t *WlanBenchTarget, phy, net string, uml int) e
 		var err error
 		// The server stops listening for a moment between runs.
 		for i := 0; i < 5; i++ {
-			r := harness.RunContext(ctx, dir, time.Duration(s.seconds+60)*time.Second, argv[0], argv[1:]...)
+			r := harness.RunContext(ctx, dir, time.Duration(s.seconds+s.omit+60)*time.Second, argv[0], argv[1:]...)
 			if res, err = harness.ParseIperf(r.Stdout); err == nil || !strings.Contains(err.Error(), "refused") {
 				break
 			}
 			time.Sleep(time.Second)
 		}
-		return res, err
+		if err != nil {
+			return nil, err
+		}
+		return map[string]float64{"mbps": res.ReceivedBPS / 1e6, "retransmits": float64(res.Retransmits)}, nil
 	}
-	for rep := 1; rep <= s.reps; rep++ {
-		for _, reverse := range []bool{false, true} {
-			if s.ctx.Err() != nil {
-				return errors.New("stopped by a signal")
-			}
-			run := WlanBenchRun{Dir: "upload", Rep: rep}
-			if reverse {
-				run.Dir = "download"
-			}
-			meter := startCPUMeter(uml)
-			res, err := iperf(s.ctx, reverse)
-			run.HostCPUs, run.UMLCPUs = meter.stop()
-			if err != nil {
-				return fmt.Errorf("%s: %v", run.Dir, err)
-			}
-			run.Mbps, run.Retransmits = res.ReceivedBPS/1e6, res.Retransmits
-			fmt.Printf("  %s %d: %.1f Mb/s, host_cpus %.2f, uml_cpus %.2f\n", run.Dir, rep, run.Mbps, run.HostCPUs, run.UMLCPUs)
-			t.Runs = append(t.Runs, run)
-			if s.guest != nil {
-				s.memory.SampleGuest(s.guest.Output("cat /proc/meminfo", 10*time.Second))
-			}
+	for rep := 1; rep <= s.opts.Reps; rep++ {
+		if err := record("ping-idle", rep, func() (map[string]float64, error) { return ping(50) }); err != nil {
+			return err
+		}
+		if err := record("upload", rep, func() (map[string]float64, error) { return iperf(s.ctx, false) }); err != nil {
+			return err
+		}
+		if err := record("download", rep, func() (map[string]float64, error) { return iperf(s.ctx, true) }); err != nil {
+			return err
+		}
+		// The round trips under load are measured during one more download.
+		err := record("ping-load", rep, func() (map[string]float64, error) {
+			ctx, cancel := context.WithCancel(s.ctx)
+			done := make(chan struct{})
+			go func() {
+				iperf(ctx, true)
+				close(done)
+			}()
+			time.Sleep(time.Duration(s.omit+1) * time.Second)
+			m, err := ping(max(1, (s.seconds-2)*5))
+			cancel()
+			<-done
+			return m, err
+		})
+		if err != nil {
+			return err
 		}
 	}
-	// The round trips under load are measured during one more download.
-	ctx, cancel := context.WithCancel(s.ctx)
-	done := make(chan struct{})
-	go func() {
-		iperf(ctx, true)
-		close(done)
-	}()
-	time.Sleep(time.Second)
-	t.PingLoaded, err = ping(max(1, (s.seconds-2)*5))
-	cancel()
-	<-done
-	return err
+	return nil
 }
 
 func cmdBenchWlanSummary(args []string) error {
@@ -491,58 +652,23 @@ Print the summary of a bench-wlan run from its results.json.`)
 		fs.Usage()
 		os.Exit(2)
 	}
-	data, err := os.ReadFile(filepath.Join(fs.Arg(0), "results.json"))
+	r, err := bench.Load(fs.Arg(0))
 	if err != nil {
 		return err
 	}
-	var r WlanBenchResults
-	if err := json.Unmarshal(data, &r); err != nil {
-		return err
-	}
-	fmt.Print(wlanBenchSummary(&r))
+	fmt.Print(wlanBenchSummary(r))
 	return nil
 }
 
-func wlanBenchSummary(r *WlanBenchResults) string {
+// wlanBenchSummary shows the link of each round's connection before the
+// summary of the jobs.
+func wlanBenchSummary(r *bench.Results) string {
 	var b strings.Builder
-	for _, t := range r.Targets {
-		fmt.Fprintf(&b, "%s: %s MHz, %s, tx %s, rx %s\n", t.Name, t.Link["freq"], t.Link["SSID"],
-			t.Link["tx bitrate"], t.Link["rx bitrate"])
-		fmt.Fprintf(&b, "  %-9s %8s %8s %8s %9s %8s\n", "", "Mb/s", "min", "max", "host_cpus", "uml_cpus")
-		for _, dir := range []string{"upload", "download"} {
-			var mbps, host, uml []float64
-			for _, run := range t.Runs {
-				if run.Dir == dir {
-					mbps = append(mbps, run.Mbps)
-					host = append(host, run.HostCPUs)
-					uml = append(uml, run.UMLCPUs)
-				}
-			}
-			if len(mbps) == 0 {
-				continue
-			}
-			lo, hi := mbps[0], mbps[0]
-			for _, v := range mbps {
-				lo, hi = min(lo, v), max(hi, v)
-			}
-			fmt.Fprintf(&b, "  %-9s %8.1f %8.1f %8.1f %9.2f %8.2f\n", dir, benchMedian(mbps), lo, hi,
-				benchMedian(host), benchMedian(uml))
-		}
-		for _, p := range []struct {
-			name string
-			p    harness.Ping
-		}{{"idle", t.PingIdle}, {"loaded", t.PingLoaded}} {
-			fmt.Fprintf(&b, "  ping %-6s avg %.2f ms, max %.2f ms, mdev %.2f ms, loss %.0f%%\n",
-				p.name, p.p.Avg, p.p.Max, p.p.Mdev, p.p.Loss)
-		}
-		b.WriteString("\n")
+	for _, in := range r.Instances {
+		fmt.Fprintf(&b, "%s round %d: %s MHz, %s, tx %s, rx %s, signal %s\n", in.Target, in.Round,
+			in.Info["link freq"], in.Info["link SSID"], in.Info["link tx bitrate"], in.Info["link rx bitrate"],
+			in.Info["link signal"])
 	}
-	for _, t := range r.Targets {
-		if t.Memory != nil {
-			fmt.Fprintf(&b, "%s memory, %s\n\n", t.Name, t.Memory.Summary())
-		}
-	}
-	b.WriteString("Mb/s is the median over the repetitions. host_cpus is how many of the\n" +
-		"host's CPUs were busy, and uml_cpus how many the guest's UML process took.\n")
-	return b.String()
+	b.WriteString("\n")
+	return b.String() + r.Summary(wlanBenchJobs)
 }

@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	"invirtio/internal/bench"
 	"invirtio/internal/harness"
 	"invirtio/internal/pci"
 )
@@ -223,7 +224,7 @@ func (s *netSuite) setup() error {
 		harness.Release(net)
 	}
 	var err error
-	if s.far, err = netStartPeer(s.peerAddr, "iperf3"); err != nil {
+	if s.far, err = netStartPeer(s.peerAddr, netMTU, "", "iperf3"); err != nil {
 		return err
 	}
 	s.peerNet = s.far.net
@@ -643,13 +644,16 @@ type netFarEnd struct {
 	servers []*exec.Cmd
 	// linkDownOnClose is i40e's flag before the test, which it restores.
 	linkDownOnClose string
+	// restoreIRQs restores the affinity of port 1's interrupts, or is nil.
+	restoreIRQs func()
 }
 
 var linkDownOnCloseRE = regexp.MustCompile(`(?m)^link-down-on-close\s*:\s*(on|off)`)
 
 // netStartPeer moves port 1 of the X710 to netPeerNS with the address
-// addr, and starts the servers there.
-func netStartPeer(addr string, servers ...string) (*netFarEnd, error) {
+// addr and the MTU, and starts the servers there. With cpus, the servers
+// run on those host CPUs and port 1's interrupts go to them.
+func netStartPeer(addr string, mtu int, cpus string, servers ...string) (*netFarEnd, error) {
 	// Deleting a namespace that an earlier run left returns port 1 to the
 	// host.
 	harness.Run("ip", "netns", "del", netPeerNS)
@@ -672,7 +676,7 @@ func netStartPeer(addr string, servers ...string) (*netFarEnd, error) {
 	for _, argv := range [][]string{
 		{"ip", "netns", "add", netPeerNS},
 		{"ip", "link", "set", f.net, "netns", netPeerNS},
-		harness.InNS(netPeerNS, "ip", "link", "set", f.net, "mtu", fmt.Sprint(netMTU), "up"),
+		harness.InNS(netPeerNS, "ip", "link", "set", f.net, "mtu", fmt.Sprint(mtu), "up"),
 		harness.InNS(netPeerNS, "ip", "addr", "add", addr+"/24", "dev", f.net),
 		harness.InNS(netPeerNS, "ip", "link", "set", "lo", "up"),
 	} {
@@ -681,10 +685,17 @@ func netStartPeer(addr string, servers ...string) (*netFarEnd, error) {
 			return nil, err
 		}
 	}
+	if cpus != "" {
+		var err error
+		if f.restoreIRQs, err = bench.SteerIRQs(netPeerPort, cpus); err != nil {
+			f.stop()
+			return nil, err
+		}
+	}
 	for _, server := range servers {
-		argv := harness.InNS(netPeerNS, server, "-s")
+		argv := harness.InNS(netPeerNS, bench.Pin(cpus, server, "-s")...)
 		if server == "netserver" {
-			argv = harness.InNS(netPeerNS, server, "-D")
+			argv = harness.InNS(netPeerNS, bench.Pin(cpus, server, "-D")...)
 		}
 		cmd := exec.Command(argv[0], argv[1:]...)
 		// The server is in a process group of its own, so that a terminal's
@@ -709,6 +720,10 @@ func (f *netFarEnd) stop() {
 		cmd.Wait()
 	}
 	f.servers = nil
+	if f.restoreIRQs != nil {
+		f.restoreIRQs()
+		f.restoreIRQs = nil
+	}
 	harness.RunArgv(harness.InNS(netPeerNS, "ip", "link", "set", f.net, "netns", "1"))
 	harness.Run("ip", "netns", "del", netPeerNS)
 	harness.Wait(func() bool { return harness.PCINetdev(netPeerPort) != "" }, 10*time.Second, 100*time.Millisecond)

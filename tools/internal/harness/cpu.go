@@ -2,23 +2,11 @@ package harness
 
 import (
 	"fmt"
-	"math/bits"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 )
-
-// HostCPU returns the host's busy and total time, in ticks, from the first
-// line of /proc/stat. Busy time is everything but idle and I/O wait.
-func HostCPU() (busy, total int64) {
-	data, err := os.ReadFile("/proc/stat")
-	if err != nil {
-		return 0, 0
-	}
-	line, _, _ := strings.Cut(string(data), "\n")
-	return ParseCPULine(line)
-}
 
 // ParseCPULine returns the busy and total ticks of a cpu line of /proc/stat.
 func ParseCPULine(line string) (busy, total int64) {
@@ -189,18 +177,4 @@ func Intersects(a, b []uint64) bool {
 		}
 	}
 	return false
-}
-
-// OnlineCPUs returns how many of the host's CPUs are online, which the
-// first line of /proc/stat covers.
-func OnlineCPUs() int {
-	mask, err := ParseCPUList(Read("/sys/devices/system/cpu/online"))
-	if err != nil {
-		return 0
-	}
-	n := 0
-	for _, w := range mask {
-		n += bits.OnesCount64(w)
-	}
-	return n
 }

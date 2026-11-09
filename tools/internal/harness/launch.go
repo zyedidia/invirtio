@@ -29,6 +29,9 @@ type Launch struct {
 	Args []string
 	// Cgroup is the cgroup that the guest runs in, or "".
 	Cgroup string
+	// IRQCPUs are the host CPUs that the devices' host interrupts are
+	// steered to, and that the launcher runs on, or "".
+	IRQCPUs string
 }
 
 // MakeLogDir makes a directory on a tmpfs for in-flight logs.
@@ -50,6 +53,9 @@ func LaunchGuest(path string, l Launch) (*Guest, error) {
 	if len(l.Devices) > 0 {
 		argv = append(argv, "-b")
 	}
+	if l.IRQCPUs != "" {
+		argv = append(argv, "-a", l.IRQCPUs)
+	}
 	for _, d := range l.Devices {
 		argv = append(argv, "-d", d)
 	}
@@ -58,7 +64,11 @@ func LaunchGuest(path string, l Launch) (*Guest, error) {
 		device += "," + l.Options
 	}
 	argv = append(argv, filepath.Join(l.Build, "linux"), device)
-	return StartGuest(path, append(argv, l.Args...)...)
+	argv = append(argv, l.Args...)
+	if l.IRQCPUs != "" {
+		argv = append([]string{"taskset", "-c", l.IRQCPUs}, argv...)
+	}
+	return StartGuest(path, argv...)
 }
 
 // UMLPid returns the UML process that a launcher started. UML's helper and
