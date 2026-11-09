@@ -17,7 +17,6 @@
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <grp.h>
 #include <limits.h>
 #include <poll.h>
 #include <pthread.h>
@@ -1044,8 +1043,15 @@ static void drop_privileges(void)
 	uid_t ruid, euid, suid;
 	gid_t rgid, egid, sgid;
 
-	if (setgroups(0, NULL) < 0 || setresgid(gid, gid, gid) < 0 ||
-	    setresuid(uid, uid, uid) < 0)
+	/*
+	 * Init is cloned without libc's fork handling, so libc still lists the
+	 * launcher's message thread, and its wrappers would wait for that
+	 * thread, which init does not have. Init has only one thread, so it
+	 * makes the system calls itself.
+	 */
+	if (syscall(SYS_setgroups, 0, NULL) < 0 ||
+	    syscall(SYS_setresgid, gid, gid, gid) < 0 ||
+	    syscall(SYS_setresuid, uid, uid, uid) < 0)
 		die("cannot switch to uid %u gid %u: %s", uid, gid,
 		    strerror(errno));
 	if (getresuid(&ruid, &euid, &suid) < 0 ||
