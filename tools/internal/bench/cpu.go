@@ -15,6 +15,24 @@ import (
 // recorded by benchmarks that read the guest's own CPU time.
 var CPUKeys = []string{"cpu_host", "cpu_app", "cpu_device", "cpu_peer", "cpu_guest", "guest_busy"}
 
+// DMAKeys are the metrics of a run's DMA mappings in the guest.
+var DMAKeys = []string{"dma_maps_per_s", "dma_premapped_per_s"}
+
+// DMARates returns the rates of the guest's DMA mappings between two
+// readings of the dma counters of its /proc/vfio_uml.
+func DMARates(before, after map[string]int64, elapsed time.Duration) map[string]float64 {
+	out := map[string]float64{}
+	if elapsed <= 0 || len(before) == 0 || len(after) == 0 {
+		return out
+	}
+	for _, k := range []string{"maps", "premapped"} {
+		if b, ok := before[k]; ok {
+			out["dma_"+k+"_per_s"] = float64(after[k]-b) / elapsed.Seconds()
+		}
+	}
+	return out
+}
+
 // A Set is a named list of host CPUs whose use a Meter measures.
 type Set struct {
 	Name string

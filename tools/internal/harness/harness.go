@@ -460,6 +460,29 @@ func (g *Guest) Counters() map[string]int64 {
 	return ParseCounters(g.Output("cat /proc/vduse_guest", 10*time.Second))
 }
 
+// ParseSection parses the counters of one section of a file such as
+// /proc/vfio_uml, whose sections start with an unindented name and hold
+// indented lines of a name and a number.
+func ParseSection(text, section string) map[string]int64 {
+	counters := map[string]int64{}
+	in := false
+	for _, line := range strings.Split(text, "\n") {
+		if line != "" && line[0] != ' ' {
+			in = strings.TrimSpace(line) == section
+			continue
+		}
+		if m := counterRE.FindStringSubmatch(line); in && m != nil {
+			counters[m[1]], _ = strconv.ParseInt(m[2], 10, 64)
+		}
+	}
+	return counters
+}
+
+// DMACounters returns the guest's VFIO DMA counters, read in its shell.
+func (g *Guest) DMACounters() map[string]int64 {
+	return ParseSection(g.Output("cat /proc/vfio_uml", 10*time.Second), "dma")
+}
+
 // Signal sends a signal to the guest's first process.
 func (g *Guest) Signal(sig syscall.Signal) error {
 	return g.cmd.Process.Signal(sig)

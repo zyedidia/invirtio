@@ -56,15 +56,17 @@ var netBenchJobs = []netBenchJob{
 }
 
 type netBenchSuite struct {
-	out     string
-	mem     string
-	build   string
-	mtu     int
-	seconds int
-	omit    int
-	opts    *bench.Options
-	jobs    []netBenchJob
-	far     *netFarEnd
+	out string
+	mem string
+	// guestArgs are added to the guest's command line.
+	guestArgs []string
+	build     string
+	mtu       int
+	seconds   int
+	omit      int
+	opts      *bench.Options
+	jobs      []netBenchJob
+	far       *netFarEnd
 	// portDriver is port 0's driver before the run, which it restores.
 	portDriver string
 	results    bench.Results
@@ -107,10 +109,12 @@ port 1's interrupts on -peer-cpus. With native-1q and the guest, the
 device's interrupts go to -device-cpu, as do the guest's CPU, its helper
 threads and its VDUSE interrupts. Each run records how many of the host's
 CPUs were busy and how many of each set's, and with the guest, how many
-CPUs the guest's cgroup took and how busy the guest's own CPU was. During
-the run, every CPU uses the performance governor, boost is as -boost says,
-and irqbalance is stopped. A summary's values are means over the rounds,
-since each round brings a target up again.
+CPUs the guest's cgroup took, how busy the guest's own CPU was, and how
+many DMA buffers it mapped each second. During the run, every CPU uses the
+performance governor, boost is as -boost says, and irqbalance is stopped.
+A summary's values are means over the rounds, since each round brings a
+target up again. -guest-args adds to the guest's command line, so that
+vfio_uml.eager_dma=1 maps all of its RAM for DMA once.
 
 The guest runs with -mem in a cgroup of its own, as invirtio's guests do,
 and the results record the cgroup's peak memory and the most memory that
@@ -127,6 +131,7 @@ Jobs:`+netBenchJobList())
 	omit := fs.Int("omit", 2, "the seconds at the start of each iperf3 run that it leaves out")
 	mtu := fs.Int("mtu", 1500, "the MTU of both ports")
 	mem := fs.String("mem", "256M", "the guest's memory, as UML's mem= takes it")
+	guestArgs := fs.String("guest-args", "", "more arguments for the guest's command line, such as vfio_uml.eager_dma=1")
 	jobs := fs.String("jobs", "", "run only the jobs whose names contain this string")
 	opts := bench.AddFlags(fs, 5, 1)
 	fs.Parse(args)
@@ -145,7 +150,8 @@ Jobs:`+netBenchJobList())
 	}
 	requireRoot()
 
-	s := &netBenchSuite{build: *build, seconds: *seconds, omit: *omit, mtu: *mtu, mem: *mem, opts: opts}
+	s := &netBenchSuite{build: *build, seconds: *seconds, omit: *omit, mtu: *mtu, mem: *mem, opts: opts,
+		guestArgs: strings.Fields(*guestArgs)}
 	for _, j := range netBenchJobs {
 		if strings.Contains(j.Name, *jobs) {
 			s.jobs = append(s.jobs, j)
@@ -244,6 +250,7 @@ func (s *netBenchSuite) env() map[string]string {
 	env["mtu"] = strconv.Itoa(s.mtu)
 	env["mem"] = s.mem
 	env["guest_build"] = s.build
+	env["guest_args"] = strings.Join(s.guestArgs, " ")
 	env["iperf3"] = strings.SplitN(harness.Run("iperf3", "--version").Stdout, "\n", 2)[0]
 	env["netperf"] = strings.TrimSpace(harness.Run("netperf", "-V").Stdout)
 	env["nic"] = strings.TrimSpace(harness.Run("lspci", "-s", netGuestPort).Stdout)
@@ -371,7 +378,7 @@ func (s *netBenchSuite) runGuest(in *bench.Instance) error {
 		Options: fmt.Sprintf("netdev=eth0,mtu=%d", s.mtu),
 		LogDir:  logDir,
 		Devices: []string{netGuestPort},
-		Args:    []string{"mem=" + s.mem},
+		Args:    append([]string{"mem=" + s.mem}, s.guestArgs...),
 		Cgroup:  cg,
 		IRQCPUs: s.opts.DeviceCPU,
 	}
@@ -433,6 +440,9 @@ func (s *netBenchSuite) runGuest(in *bench.Instance) error {
 		return err
 	}
 	in.Counters = g.Counters()
+	for k, v := range g.DMACounters() {
+		in.Counters["dma_"+k] = v
+	}
 	if err := s.memory.ReadCgroup(cg); err != nil {
 		return err
 	}
@@ -447,7 +457,7 @@ func (s *netBenchSuite) guestCPU() (int64, int64) {
 }
 
 // runJobs runs each job -reps times from the namespace ns, with the CPU
-// use of each run.
+// use of each run and the guest's DMA mappings.
 func (s *netBenchSuite) runJobs(in *bench.Instance, ns string) error {
 	for _, j := range s.jobs {
 		for rep := 1; rep <= s.opts.Reps; rep++ {
@@ -455,12 +465,16 @@ func (s *netBenchSuite) runJobs(in *bench.Instance, ns string) error {
 				return errors.New("stopped by a signal")
 			}
 			var gbusy0, gtotal0 int64
+			var dma0 map[string]int64
 			if s.guest != nil {
+				dma0 = s.guest.DMACounters()
 				gbusy0, gtotal0 = s.guestCPU()
 			}
+			start := time.Now()
 			meter := bench.StartMeter(s.opts.Sets(), s.cgroup)
 			m, err := j.run(s, ns)
 			cpu := meter.Stop()
+			elapsed := time.Since(start)
 			if err != nil {
 				return fmt.Errorf("%s: %v", j.Name, err)
 			}
@@ -471,6 +485,9 @@ func (s *netBenchSuite) runJobs(in *bench.Instance, ns string) error {
 				gbusy1, gtotal1 := s.guestCPU()
 				if gtotal1 > gtotal0 && gtotal0 > 0 {
 					m["guest_busy"] = float64(gbusy1-gbusy0) / float64(gtotal1-gtotal0)
+				}
+				for k, v := range bench.DMARates(dma0, s.guest.DMACounters(), elapsed) {
+					m[k] = v
 				}
 				s.memory.SampleGuest(s.guest.Output("cat /proc/meminfo", 10*time.Second))
 			}

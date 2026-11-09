@@ -70,8 +70,10 @@ type wlanBenchSuite struct {
 	seconds      int
 	omit         int
 	mem          string
-	opts         *bench.Options
-	results      bench.Results
+	// guestArgs are added to the guest's command line.
+	guestArgs []string
+	opts      *bench.Options
+	results   bench.Results
 	// The guest of the guest target and its cgroup, whose memory is
 	// sampled between runs and whose CPU use is measured.
 	guest  *harness.Guest
@@ -117,8 +119,11 @@ The benchmark's programs run on -app-cpus, and the iperf3 server on
 -peer-cpus. The card's interrupts and the guest's CPU, its helper threads
 and its VDUSE interrupts go to -device-cpu. Each run records how many of the
 host's CPUs were busy and how many of each set's, and with the guest, how
-many CPUs the guest's cgroup took. During the run, every CPU uses the
-performance governor, boost is as -boost says, and irqbalance is stopped.
+many CPUs the guest's cgroup took and how many DMA buffers it mapped each
+second. During the run, every CPU uses the performance governor, boost is
+as -boost says, and irqbalance is stopped. -guest-args adds to the guest's
+command line, so that vfio_uml.eager_dma=1 maps all of its RAM for DMA
+once.
 
 The guest runs with -mem in a cgroup of its own, as invirtio's guests do,
 and the results record the cgroup's peak memory and the most memory that
@@ -141,6 +146,7 @@ Jobs:`+wlanBenchJobList())
 	seconds := fs.Int("time", 10, "the seconds that each iperf3 run measures")
 	omit := fs.Int("omit", 2, "the seconds at the start of each iperf3 run that it leaves out")
 	mem := fs.String("mem", "256M", "the guest's memory, as UML's mem= takes it")
+	guestArgs := fs.String("guest-args", "", "more arguments for the guest's command line, such as vfio_uml.eager_dma=1")
 	hostDriver := fs.String("host-driver", "mt7921e", "the card's host driver, which is loaded for the native target")
 	unbindNative := fs.Bool("unbind-native", false, "allow unbinding the host driver, so that native and guest rounds interleave")
 	opts := bench.AddFlags(fs, 5, 2)
@@ -165,7 +171,7 @@ Jobs:`+wlanBenchJobList())
 	requireRoot()
 
 	s := &wlanBenchSuite{build: *build, conf: *conf, server: *server, noServer: *noServer, mem: *mem,
-		hostDriver: *hostDriver, unbindNative: *unbindNative,
+		hostDriver: *hostDriver, unbindNative: *unbindNative, guestArgs: strings.Fields(*guestArgs),
 		seconds: *seconds, omit: *omit, opts: opts}
 	var err error
 	if s.card, err = pci.NormalizeAddress(*card); err != nil {
@@ -296,6 +302,7 @@ func (s *wlanBenchSuite) env() map[string]string {
 	env["omit"] = strconv.Itoa(s.omit)
 	env["mem"] = s.mem
 	env["guest_build"] = s.build
+	env["guest_args"] = strings.Join(s.guestArgs, " ")
 	env["iperf3"] = strings.SplitN(harness.Run("iperf3", "--version").Stdout, "\n", 2)[0]
 	env["wpa_supplicant"] = strings.TrimSpace(harness.Run("wpa_supplicant", "-v").Stdout)
 	return env
@@ -370,7 +377,7 @@ func (s *wlanBenchSuite) runGuest(in *bench.Instance) error {
 		Name:    wlanBenchName,
 		LogDir:  logDir,
 		Devices: []string{s.card},
-		Args:    []string{"mem=" + s.mem},
+		Args:    append([]string{"mem=" + s.mem}, s.guestArgs...),
 		Cgroup:  cg,
 		IRQCPUs: s.opts.DeviceCPU,
 	}
@@ -416,6 +423,9 @@ func (s *wlanBenchSuite) runGuest(in *bench.Instance) error {
 		return err
 	}
 	in.Counters = g.Counters()
+	for k, v := range g.DMACounters() {
+		in.Counters["dma_"+k] = v
+	}
 	s.memory.SampleGuest(g.Output("cat /proc/meminfo", 10*time.Second))
 	if err := s.memory.ReadCgroup(cg); err != nil {
 		return err
@@ -490,19 +500,31 @@ func (s *wlanBenchSuite) measure(in *bench.Instance, phy, net string) error {
 		defer stop(server)
 	}
 
-	// record runs one repetition of a job with its CPU use.
+	// record runs one repetition of a job with its CPU use and the guest's
+	// DMA mappings.
 	record := func(job string, rep int, run func() (map[string]float64, error)) error {
 		if s.ctx.Err() != nil {
 			return errors.New("stopped by a signal")
 		}
+		var dma0 map[string]int64
+		if s.guest != nil {
+			dma0 = s.guest.DMACounters()
+		}
+		start := time.Now()
 		meter := bench.StartMeter(s.opts.Sets(), s.cgroup)
 		m, err := run()
 		cpu := meter.Stop()
+		elapsed := time.Since(start)
 		if err != nil {
 			return fmt.Errorf("%s: %v", job, err)
 		}
 		for k, v := range cpu {
 			m[k] = v
+		}
+		if s.guest != nil {
+			for k, v := range bench.DMARates(dma0, s.guest.DMACounters(), elapsed) {
+				m[k] = v
+			}
 		}
 		j := wlanBenchJobs[slices.IndexFunc(wlanBenchJobs, func(j bench.Job) bool { return j.Name == job })]
 		fmt.Printf("  %s %d: %s\n", job, rep, bench.Format(j, m))

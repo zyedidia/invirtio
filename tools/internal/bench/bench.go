@@ -196,10 +196,11 @@ func FormatValue(v float64) string {
 }
 
 // Format describes a run's metrics in one line, the job's metrics first and
-// then its CPU use.
+// then its CPU use and the guest's DMA mappings.
 func Format(j Job, m map[string]float64) string {
 	var parts []string
-	for _, k := range append(append([]string(nil), j.Metrics...), CPUKeys...) {
+	keys := append(append([]string(nil), j.Metrics...), CPUKeys...)
+	for _, k := range append(keys, DMAKeys...) {
 		if v, ok := m[k]; ok {
 			parts = append(parts, k+" "+FormatValue(v))
 		}
@@ -260,10 +261,40 @@ func (r *Results) values(job, target, metric string) ([]float64, bool) {
 	return xs, len(xs) > 0
 }
 
+// means formats a table of the mean of each of the keys that a job's runs
+// on the targets have, or "" if they have none.
+func (r *Results) means(job string, targets []string, label string, keys []string) string {
+	var have []string
+	for _, k := range keys {
+		for _, t := range targets {
+			if _, ok := r.values(job, t, k); ok {
+				have = append(have, k)
+				break
+			}
+		}
+	}
+	if len(have) == 0 {
+		return ""
+	}
+	rows := [][]string{append([]string{label}, have...)}
+	for _, t := range targets {
+		row := []string{t}
+		for _, k := range have {
+			cell := "-"
+			if xs, ok := r.values(job, t, k); ok {
+				cell = FormatValue(Summarize(xs).Mean)
+			}
+			row = append(row, cell)
+		}
+		rows = append(rows, row)
+	}
+	return table(rows)
+}
+
 // Summary shows, for each job, the mean over the rounds of each metric on
 // each target with the half-width of its confidence interval and its ratio
-// to the first target's mean, and then the mean CPU use. It ends with the
-// largest memory of each target's guest.
+// to the first target's mean, and then the mean CPU use and the guest's DMA
+// mappings. It ends with the largest memory of each target's guest.
 func (r *Results) Summary(jobs []Job) string {
 	var b strings.Builder
 	for _, j := range jobs {
@@ -300,31 +331,9 @@ func (r *Results) Summary(jobs []Job) string {
 			}
 			rows = append(rows, row)
 		}
-		var keys []string
-		for _, k := range CPUKeys {
-			for _, t := range targets {
-				if _, ok := r.values(j.Name, t, k); ok {
-					keys = append(keys, k)
-					break
-				}
-			}
-		}
 		b.WriteString(table(rows))
-		if len(keys) > 0 {
-			rows = [][]string{append([]string{"cpu"}, keys...)}
-			for _, t := range targets {
-				row := []string{t}
-				for _, k := range keys {
-					cell := "-"
-					if xs, ok := r.values(j.Name, t, k); ok {
-						cell = FormatValue(Summarize(xs).Mean)
-					}
-					row = append(row, cell)
-				}
-				rows = append(rows, row)
-			}
-			b.WriteString(table(rows))
-		}
+		b.WriteString(r.means(j.Name, targets, "cpu", CPUKeys))
+		b.WriteString(r.means(j.Name, targets, "dma", DMAKeys))
 		b.WriteString("\n")
 	}
 	b.WriteString("Each value is the mean over the rounds of each round's mean, with the\n" +
@@ -332,7 +341,9 @@ func (r *Results) Summary(jobs []Job) string {
 		"target. cpu_host is how many of the host's CPUs were busy, and cpu_app,\n" +
 		"cpu_device and cpu_peer how many of the CPUs of each set. cpu_guest is\n" +
 		"how many CPUs the guest's cgroup took, and guest_busy how busy the\n" +
-		"guest's own CPU was.\n")
+		"guest's own CPU was. dma_maps_per_s is how many buffers the guest\n" +
+		"mapped into the host's IOMMU each second, and dma_premapped_per_s how\n" +
+		"many the eagerly mapped RAM served.\n")
 	for _, t := range r.Targets {
 		var top *harness.GuestMemory
 		n := 0
