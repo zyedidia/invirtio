@@ -49,7 +49,7 @@ var wlanCounters = []string{"cmd_timeouts", "bad_responses", "bad_events", "bad_
 	"tx_timeouts", "rx_post_errors", "eapol_timeouts"}
 
 // wlanGuestCounters are the backend's error counters, which stay at zero.
-var wlanGuestCounters = []string{"tx_invalid", "tx_spoofed", "tx_dropped", "rx_oversized", "rx_bad_buffers"}
+var wlanGuestCounters = []string{"tx_invalid", "tx_spoofed", "tx_dropped", "rx_oversized", "rx_bad_buffers", "rx_dropped"}
 
 // wlanWPA are the networks that wpa_supplicant joins, with its MFP setting
 // for each. The WPA2-PSK networks renew their pairwise key every 6 seconds
@@ -526,7 +526,8 @@ func (s *wlanSuite) lease(net string) bool {
 }
 
 // traffic gets a lease, then pings the access points' bridge and runs
-// iperf3 against it both ways.
+// iperf3 against it both ways. The host's TCP reaches the guest as GSO
+// frames, which the guest splits.
 func (s *wlanSuite) traffic(g *harness.Guest, net string) {
 	s.Check(wlanCarrier(net), "%s has carrier while connected", net)
 	if !s.lease(net) {
@@ -536,6 +537,7 @@ func (s *wlanSuite) traffic(g *harness.Guest, net string) {
 	r := harness.RunContext(s.ctx, s.dir, time.Minute, "ping", "-c", "5", "-i", "0.2", "-W", "2", "-I", net, wlanServer)
 	p, _ := harness.ParsePing(r.Output())
 	s.Check(r.OK() && p.Received == 5, "ping %s gets 5 replies: %d", wlanServer, p.Received)
+	gso := g.Counters()["tx_gso"]
 	for _, reverse := range []bool{false, true} {
 		argv := []string{"iperf3", "-c", wlanServer, "--bind-dev", net, "-t", "3", "-J"}
 		what := "to"
@@ -559,6 +561,8 @@ func (s *wlanSuite) traffic(g *harness.Guest, net string) {
 			fmt.Println(g.Output("pidof iperf3; cat /tmp/iperf3.log", 10*time.Second))
 		}
 	}
+	n := g.Counters()["tx_gso"] - gso
+	s.Check(n > 0, "the host sends GSO frames to the guest: %d", n)
 }
 
 // wlanBand is a band of iw phy info.
