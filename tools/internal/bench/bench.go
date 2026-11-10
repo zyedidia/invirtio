@@ -342,8 +342,9 @@ func (r *Results) Summary(jobs []Job) string {
 		"cpu_device and cpu_peer how many of the CPUs of each set. cpu_guest is\n" +
 		"how many CPUs the guest's cgroup took, and guest_busy how busy the\n" +
 		"guest's own CPU was. dma_maps_per_s is how many buffers the guest\n" +
-		"mapped into the host's IOMMU each second, and dma_premapped_per_s how\n" +
-		"many the eagerly mapped RAM served.\n")
+		"mapped into the host's IOMMU each second, dma_cached_per_s how many a\n" +
+		"cached mapping served, and dma_premapped_per_s how many the eagerly\n" +
+		"mapped RAM served.\n")
 	for _, t := range r.Targets {
 		var top *harness.GuestMemory
 		n := 0

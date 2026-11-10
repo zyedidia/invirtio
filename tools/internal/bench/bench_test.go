@@ -97,8 +97,9 @@ func TestResults(t *testing.T) {
 }
 
 func TestDMARates(t *testing.T) {
-	r := DMARates(map[string]int64{"maps": 100, "premapped": 0}, map[string]int64{"maps": 300, "premapped": 50}, 2*time.Second)
-	if r["dma_maps_per_s"] != 100 || r["dma_premapped_per_s"] != 25 {
+	r := DMARates(map[string]int64{"maps": 100, "cached": 10, "premapped": 0},
+		map[string]int64{"maps": 300, "cached": 30, "premapped": 50}, 2*time.Second)
+	if r["dma_maps_per_s"] != 100 || r["dma_cached_per_s"] != 10 || r["dma_premapped_per_s"] != 25 {
 		t.Errorf("DMARates = %v", r)
 	}
 	if len(DMARates(nil, map[string]int64{"maps": 1}, time.Second)) != 0 {

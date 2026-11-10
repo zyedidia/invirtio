@@ -16,7 +16,7 @@ import (
 var CPUKeys = []string{"cpu_host", "cpu_app", "cpu_device", "cpu_peer", "cpu_guest", "guest_busy"}
 
 // DMAKeys are the metrics of a run's DMA mappings in the guest.
-var DMAKeys = []string{"dma_maps_per_s", "dma_premapped_per_s"}
+var DMAKeys = []string{"dma_maps_per_s", "dma_cached_per_s", "dma_premapped_per_s"}
 
 // DMARates returns the rates of the guest's DMA mappings between two
 // readings of the dma counters of its /proc/vfio_uml.
@@ -25,7 +25,7 @@ func DMARates(before, after map[string]int64, elapsed time.Duration) map[string]
 	if elapsed <= 0 || len(before) == 0 || len(after) == 0 {
 		return out
 	}
-	for _, k := range []string{"maps", "premapped"} {
+	for _, k := range []string{"maps", "cached", "premapped"} {
 		if b, ok := before[k]; ok {
 			out["dma_"+k+"_per_s"] = float64(after[k]-b) / elapsed.Seconds()
 		}
