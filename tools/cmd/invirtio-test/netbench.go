@@ -36,37 +36,45 @@ const (
 
 var netBenchTargets = []string{"native", "native-1q", "guest"}
 
-// A netBenchJob is one measurement, run against every target.
+// A netBenchJob is one measurement, run against every target. Omits is set
+// for the jobs that leave out their first -omit seconds.
 type netBenchJob struct {
 	bench.Job
-	run func(s *netBenchSuite, ns string) (map[string]float64, error)
+	run   func(s *netBenchSuite, ns string) (map[string]float64, error)
+	omits bool
 }
 
 var netBenchJobs = []netBenchJob{
-	{bench.Job{Name: "tcp-tx-1", About: "TCP to the far end, one stream", Metrics: []string{"gbps", "retransmits"}}, netBenchTCP(false, 1)},
-	{bench.Job{Name: "tcp-tx-4", About: "TCP to the far end, four streams", Metrics: []string{"gbps", "retransmits"}}, netBenchTCP(false, 4)},
-	{bench.Job{Name: "tcp-rx-1", About: "TCP from the far end, one stream", Metrics: []string{"gbps", "retransmits"}}, netBenchTCP(true, 1)},
-	{bench.Job{Name: "tcp-rx-4", About: "TCP from the far end, four streams", Metrics: []string{"gbps", "retransmits"}}, netBenchTCP(true, 4)},
-	{bench.Job{Name: "udp64-tx", About: "64-byte UDP datagrams to the far end at an unlimited rate", Metrics: []string{"sent_kpps", "received_kpps", "loss_pct"}}, netBenchUDP(false)},
-	{bench.Job{Name: "udp64-rx", About: "64-byte UDP datagrams from the far end at an unlimited rate", Metrics: []string{"sent_kpps", "received_kpps", "loss_pct"}}, netBenchUDP(true)},
-	{bench.Job{Name: "tcp-rr", About: "netperf TCP_RR with 1-byte messages", Metrics: []string{"tps", "mean_us", "p99_us"}}, netBenchRR("TCP_RR")},
-	{bench.Job{Name: "udp-rr", About: "netperf UDP_RR with 1-byte messages", Metrics: []string{"tps", "mean_us", "p99_us"}}, netBenchRR("UDP_RR")},
-	{bench.Job{Name: "ping-idle", About: "ping round trips on an idle link", Metrics: []string{"avg_us", "max_us", "mdev_us"}}, netBenchPing(false)},
-	{bench.Job{Name: "ping-load", About: "ping round trips during a TCP stream", Metrics: []string{"avg_us", "max_us", "mdev_us"}}, netBenchPing(true)},
+	{bench.Job{Name: "tcp-tx-1", About: "TCP to the far end, one stream", Metrics: []string{"gbps", "retransmits"}}, netBenchTCP(false, 1), true},
+	{bench.Job{Name: "tcp-tx-4", About: "TCP to the far end, four streams", Metrics: []string{"gbps", "retransmits"}}, netBenchTCP(false, 4), true},
+	{bench.Job{Name: "tcp-rx-1", About: "TCP from the far end, one stream", Metrics: []string{"gbps", "retransmits"}}, netBenchTCP(true, 1), true},
+	{bench.Job{Name: "tcp-rx-4", About: "TCP from the far end, four streams", Metrics: []string{"gbps", "retransmits"}}, netBenchTCP(true, 4), true},
+	{bench.Job{Name: "udp64-tx", About: "64-byte UDP datagrams to the far end at an unlimited rate", Metrics: []string{"sent_kpps", "received_kpps", "loss_pct"}}, netBenchUDP(false), true},
+	{bench.Job{Name: "udp64-rx", About: "64-byte UDP datagrams from the far end at an unlimited rate", Metrics: []string{"sent_kpps", "received_kpps", "loss_pct"}}, netBenchUDP(true), true},
+	{bench.Job{Name: "tcp-rr", About: "netperf TCP_RR with 1-byte messages", Metrics: []string{"tps", "mean_us", "p99_us"}}, netBenchRR("TCP_RR"), false},
+	{bench.Job{Name: "udp-rr", About: "netperf UDP_RR with 1-byte messages", Metrics: []string{"tps", "mean_us", "p99_us"}}, netBenchRR("UDP_RR"), false},
+	{bench.Job{Name: "ping-idle", About: "ping round trips on an idle link", Metrics: []string{"avg_us", "max_us", "mdev_us"}}, netBenchPing(false), false},
+	{bench.Job{Name: "ping-load", About: "ping round trips during a TCP stream", Metrics: []string{"avg_us", "max_us", "mdev_us"}}, netBenchPing(true), false},
 }
 
 type netBenchSuite struct {
 	out string
 	mem string
-	// guestArgs are added to the guest's command line.
-	guestArgs []string
-	build     string
-	mtu       int
-	seconds   int
-	omit      int
-	opts      *bench.Options
-	jobs      []netBenchJob
-	far       *netFarEnd
+	// guestArgs are added to the guest's command line, and guestSetup
+	// runs in its shell once it boots.
+	guestArgs  []string
+	guestSetup string
+	// perfJob selects the jobs that are profiled, or is "". Their
+	// profiles are reported once the guests are gone.
+	perfJob  string
+	profiles []*bench.Profile
+	build    string
+	mtu      int
+	seconds  int
+	omit     int
+	opts     *bench.Options
+	jobs     []netBenchJob
+	far      *netFarEnd
 	// portDriver is port 0's driver before the run, which it restores.
 	portDriver string
 	results    bench.Results
@@ -119,10 +127,17 @@ vfio_uml.eager_dma=1 maps all of its RAM for DMA once.
 The guest runs with -mem in a cgroup of its own, as invirtio's guests do,
 and the results record the cgroup's peak memory and the most memory that
 the guest itself used between jobs. Build the guest with
-scripts/invirtio-build-guest.sh. The output directory gets results.json,
-runs.csv with one metric of one run on each line, and the summary, which
-bench-net-summary prints again. Run as root on the linux-host kernel, with
-iperf3, netperf and ethtool.
+scripts/invirtio-build-guest.sh. -guest-setup runs shell commands in the
+guest once it boots, and fails the run if they do not finish. With -perf,
+perf records the device CPU, or every CPU without pinning, during each run
+of the matching jobs, after the omitted seconds of iperf3, into
+perf-<job>-<target>-<round>-<rep>.data in the output directory. Its
+messages go to .data.log. Once the bench ends and the guests have exited,
+which perf needs to find their symbols, reports by symbol go to .data.txt
+and by command and object to .data.dso.txt. The output directory gets
+results.json, runs.csv with one metric of one run on each line, and the
+summary, which bench-net-summary prints again. Run as root on the
+linux-host kernel, with iperf3, netperf and ethtool, and perf for -perf.
 
 Jobs:`+netBenchJobList())
 	build := fs.String("guest", filepath.Join(root, "linux-uml/build-invirtio"), "the build directory of the guest")
@@ -132,6 +147,8 @@ Jobs:`+netBenchJobList())
 	mtu := fs.Int("mtu", 1500, "the MTU of both ports")
 	mem := fs.String("mem", "256M", "the guest's memory, as UML's mem= takes it")
 	guestArgs := fs.String("guest-args", "", "more arguments for the guest's command line, such as vfio_uml.eager_dma=1")
+	guestSetup := fs.String("guest-setup", "", "shell commands to run in the guest once it boots")
+	perfJob := fs.String("perf", "", "profile the device CPU with perf during the jobs whose names contain this string")
 	jobs := fs.String("jobs", "", "run only the jobs whose names contain this string")
 	opts := bench.AddFlags(fs, 5, 1)
 	fs.Parse(args)
@@ -151,7 +168,7 @@ Jobs:`+netBenchJobList())
 	requireRoot()
 
 	s := &netBenchSuite{build: *build, seconds: *seconds, omit: *omit, mtu: *mtu, mem: *mem, opts: opts,
-		guestArgs: strings.Fields(*guestArgs)}
+		guestArgs: strings.Fields(*guestArgs), guestSetup: *guestSetup, perfJob: *perfJob}
 	for _, j := range netBenchJobs {
 		if strings.Contains(j.Name, *jobs) {
 			s.jobs = append(s.jobs, j)
@@ -167,7 +184,11 @@ Jobs:`+netBenchJobList())
 	if err := harness.TeeOutput(filepath.Join(s.out, "bench.log")); err != nil {
 		return err
 	}
-	for _, tool := range []string{"iperf3", "netperf", "netserver", "ethtool", "vdpa", "ping", "taskset"} {
+	tools := []string{"iperf3", "netperf", "netserver", "ethtool", "vdpa", "ping", "taskset"}
+	if s.perfJob != "" {
+		tools = append(tools, "perf")
+	}
+	for _, tool := range tools {
 		if harness.Run("sh", "-c", "command -v "+tool).Code != 0 {
 			return fmt.Errorf("%s is not installed", tool)
 		}
@@ -197,6 +218,7 @@ Jobs:`+netBenchJobList())
 		return err
 	}
 	defer s.cleanup()
+	defer s.report()
 
 	for round := 1; round <= opts.Rounds; round++ {
 		for _, name := range bench.Order(targets, round) {
@@ -251,10 +273,21 @@ func (s *netBenchSuite) env() map[string]string {
 	env["mem"] = s.mem
 	env["guest_build"] = s.build
 	env["guest_args"] = strings.Join(s.guestArgs, " ")
+	env["guest_setup"] = s.guestSetup
+	env["perf"] = s.perfJob
 	env["iperf3"] = strings.SplitN(harness.Run("iperf3", "--version").Stdout, "\n", 2)[0]
 	env["netperf"] = strings.TrimSpace(harness.Run("netperf", "-V").Stdout)
 	env["nic"] = strings.TrimSpace(harness.Run("lspci", "-s", netGuestPort).Stdout)
 	return env
+}
+
+// report writes the reports of the profiles, once every guest has exited.
+func (s *netBenchSuite) report() {
+	for _, p := range s.profiles {
+		if err := p.Report(); err != nil {
+			fmt.Println("warning:", err)
+		}
+	}
 }
 
 func (s *netBenchSuite) cleanup() {
@@ -432,6 +465,15 @@ func (s *netBenchSuite) runGuest(in *bench.Instance) error {
 	if !strings.Contains(g.Output("echo shell-ready", 30*time.Second), "shell-ready") {
 		return errors.New("the guest's shell does not answer, see " + g.Path)
 	}
+	if s.guestSetup != "" {
+		const done = "guest-setup-done"
+		// A subshell takes commands that end in a separator.
+		out := g.Output("("+s.guestSetup+"); echo "+done, time.Minute)
+		if !strings.Contains(out, done) {
+			return errors.New("the guest setup did not finish, see " + g.Path)
+		}
+		fmt.Print(strings.Replace(out, done+"\n", "", 1))
+	}
 	in.Info = netInfo(netBenchNS, net)
 	s.guest, s.cgroup = g, cg
 	s.memory = &harness.GuestMemory{Mem: s.mem}
@@ -470,11 +512,31 @@ func (s *netBenchSuite) runJobs(in *bench.Instance, ns string) error {
 				dma0 = s.guest.DMACounters()
 				gbusy0, gtotal0 = s.guestCPU()
 			}
+			var prof *bench.Profile
+			if s.perfJob != "" && strings.Contains(j.Name, s.perfJob) {
+				data := filepath.Join(s.out, fmt.Sprintf("perf-%s-%s-%d-%d.data", j.Name, in.Target, in.Round, rep))
+				var delay time.Duration
+				if j.omits {
+					delay = time.Duration(s.omit) * time.Second
+				}
+				var err error
+				prof, err = bench.StartProfile(s.ctx, s.opts.DeviceCPU, data, delay,
+					time.Duration(s.seconds+60)*time.Second)
+				if err != nil {
+					return fmt.Errorf("%s: %v", j.Name, err)
+				}
+			}
 			start := time.Now()
 			meter := bench.StartMeter(s.opts.Sets(), s.cgroup)
 			m, err := j.run(s, ns)
 			cpu := meter.Stop()
 			elapsed := time.Since(start)
+			if prof != nil {
+				if perr := prof.Stop(); perr != nil && err == nil {
+					err = perr
+				}
+				s.profiles = append(s.profiles, prof)
+			}
 			if err != nil {
 				return fmt.Errorf("%s: %v", j.Name, err)
 			}
