@@ -81,13 +81,15 @@ func deqpCaseList(mustpass, path string) (int, error) {
 }
 
 // runDeqp runs the cases of a case list, with its output and results in
-// dir, and returns the results. A crash ends the run, which then has no
-// totals and is not complete.
-func runDeqp(ctx context.Context, p deqpPaths, env []string, caselist, dir string) (deqpResult, error) {
+// dir, and returns the results. The command function makes the command with
+// the Mesa prefix. A crash ends the run, which then has no totals and is not
+// complete.
+func runDeqp(ctx context.Context, p deqpPaths, command func(context.Context, string, ...string) *exec.Cmd,
+	caselist, dir string) (deqpResult, error) {
 	var r deqpResult
 	ctx, cancel := context.WithTimeout(ctx, 2*time.Hour)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, p.bin,
+	cmd := command(ctx, p.bin,
 		"--deqp-caselist-file="+caselist,
 		"--deqp-archive-dir="+p.dir,
 		"--deqp-log-filename="+filepath.Join(dir, "TestResults.qpa"),
@@ -95,7 +97,6 @@ func runDeqp(ctx context.Context, p deqpPaths, env []string, caselist, dir strin
 		"--deqp-log-images=disable",
 		"--deqp-log-shader-sources=disable")
 	cmd.Dir = dir
-	cmd.Env = env
 	out, err := cmd.CombinedOutput()
 	if ctx.Err() == context.DeadlineExceeded {
 		err = fmt.Errorf("timed out after 2 hours")
@@ -196,7 +197,12 @@ the output directory, and the cases that did not pass are listed.`)
 		return fmt.Errorf("the case list is empty, check %s", p.mustpass)
 	}
 	fmt.Printf("running %d cases, see %s\n", n, filepath.Join(dir, "deqp.log"))
-	r, err := runDeqp(context.Background(), p, mesaEnviron(*mesa), caselist, dir)
+	native := func(ctx context.Context, name string, args ...string) *exec.Cmd {
+		cmd := exec.CommandContext(ctx, name, args...)
+		cmd.Env = mesaEnviron(*mesa)
+		return cmd
+	}
+	r, err := runDeqp(context.Background(), p, native, caselist, dir)
 	r.summary()
 	if !r.complete {
 		return fmt.Errorf("the run did not finish%s", errSuffix(err))
@@ -236,7 +242,7 @@ func gpuTestDeqp(s *gpuSuite) {
 	}
 
 	before := s.commands(g)
-	r, err := runDeqp(s.ctx, p, s.mesaEnv(), caselist, s.dir)
+	r, err := runDeqp(s.ctx, p, s.mesaCommand, caselist, s.dir)
 	r.summary()
 	s.Check(r.complete && r.executed == n, "dEQP runs its %d cases%s, %d ran, see deqp.log",
 		n, errSuffix(err), r.executed)

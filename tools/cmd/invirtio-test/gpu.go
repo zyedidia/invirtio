@@ -933,6 +933,43 @@ func (s *gpuSuite) mesaEnv() []string {
 	return mesaEnviron(s.mesa)
 }
 
+// mesaIsolation is a shell script, for unshare --mount, that replaces
+// /dev/dri with a directory of the nodes in GPU_NODES, each given as
+// name=major:minor, and then runs its arguments.
+const mesaIsolation = `mount -t tmpfs -o mode=0755 none /dev/dri || exit 125
+for e in $GPU_NODES; do
+	n=${e%%=*} d=${e#*=}
+	mknod -m 0600 "/dev/dri/$n" c "${d%:*}" "${d#*:}" || exit 125
+done
+exec "$@"`
+
+// mesaCommand returns a command that runs a program with the Mesa prefix in
+// a mount namespace whose /dev/dri holds only the device's DRM nodes. RADV
+// and EGL would otherwise pick a GPU that the host drives itself, if the
+// host has one. The program replaces the shell, so it keeps the command's
+// process and exit status.
+func (s *gpuSuite) mesaCommand(ctx context.Context, name string, args ...string) *exec.Cmd {
+	argv := append([]string{"--mount", "sh", "-c", mesaIsolation, "sh", name}, args...)
+	cmd := exec.CommandContext(ctx, "unshare", argv...)
+	cmd.Env = append(s.mesaEnv(), "GPU_NODES="+gpuNodes())
+	return cmd
+}
+
+// gpuNodes returns the DRM nodes that virtio_gpu registered for the device,
+// as name=major:minor separated by spaces.
+func gpuNodes() string {
+	dir := filepath.Join("/sys/bus/vdpa/devices", gpuName, "drm")
+	var nodes []string
+	for _, pattern := range []string{"card*", "renderD*"} {
+		for _, n := range harness.Glob(filepath.Join(dir, pattern)) {
+			if dev := harness.Read(filepath.Join(dir, n, "dev")); dev != "" {
+				nodes = append(nodes, n+"="+dev)
+			}
+		}
+	}
+	return strings.Join(nodes, " ")
+}
+
 // mesaEnviron returns an environment that uses a Mesa prefix, as
 // scripts/mesa-env.sh sets up.
 func mesaEnviron(prefix string) []string {
@@ -959,8 +996,8 @@ func gpuTestMesa(s *gpuSuite) {
 	if node == "" {
 		return
 	}
-	cmd := exec.CommandContext(s.ctx, "vulkaninfo", "--summary")
-	cmd.Env = append(s.mesaEnv(), "RADV_DEBUG=startup")
+	cmd := s.mesaCommand(s.ctx, "vulkaninfo", "--summary")
+	cmd.Env = append(cmd.Env, "RADV_DEBUG=startup")
 	// Vulkaninfo fails without a GPU behind the capset, so only its
 	// output counts.
 	out, err := cmd.CombinedOutput()
@@ -983,8 +1020,7 @@ func (s *gpuSuite) runMesa(log string, name string, args ...string) string {
 func (s *gpuSuite) runMesaFor(timeout time.Duration, log string, name string, args ...string) string {
 	ctx, cancel := context.WithTimeout(s.ctx, timeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, name, args...)
-	cmd.Env = s.mesaEnv()
+	cmd := s.mesaCommand(ctx, name, args...)
 	out, err := cmd.CombinedOutput()
 	os.WriteFile(filepath.Join(s.dir, log), out, 0644)
 	s.Check(err == nil, "%s runs%s, see %s", name, errSuffix(err), log)
@@ -1060,8 +1096,7 @@ func gpuTestRender(s *gpuSuite) {
 	before := s.commands(g)
 	ctx, cancel := context.WithTimeout(s.ctx, 10*time.Minute)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "vkmark", "--winsys", "headless")
-	cmd.Env = s.mesaEnv()
+	cmd := s.mesaCommand(ctx, "vkmark", "--winsys", "headless")
 	out, err := cmd.CombinedOutput()
 	os.WriteFile(filepath.Join(s.dir, "vkmark.log"), out, 0644)
 	log := string(out)
@@ -1163,8 +1198,7 @@ func gpuTestEvict(s *gpuSuite) {
 	if s.vram {
 		args = append(args, "vram")
 	}
-	cmd := exec.CommandContext(ctx, prog, args...)
-	cmd.Env = s.mesaEnv()
+	cmd := s.mesaCommand(ctx, prog, args...)
 	cmd.Stderr = log
 	stdin, err := cmd.StdinPipe()
 	var stdout io.ReadCloser
@@ -1590,9 +1624,8 @@ func gpuTestDisplayBench(s *gpuSuite) {
 	flips := g.Counters()["flips"]
 	ctx, cancel := context.WithTimeout(s.ctx, 10*time.Minute)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "vkmark", "--winsys", "kms", "-p", "mailbox",
+	cmd := s.mesaCommand(ctx, "vkmark", "--winsys", "kms", "-p", "mailbox",
 		"--winsys-options", "kms-drm-device="+card)
-	cmd.Env = s.mesaEnv()
 	out, err := cmd.CombinedOutput()
 	os.WriteFile(filepath.Join(s.dir, "vkmark.log"), out, 0644)
 	log := string(out)
@@ -1653,8 +1686,7 @@ func gpuTestTeardown(s *gpuSuite) {
 		}
 		file := fmt.Sprintf("vk-blobs-%d.log", i)
 		ctx, cancel := context.WithTimeout(s.ctx, 2*time.Minute)
-		cmd := exec.CommandContext(ctx, prog, node, strconv.Itoa(buffers))
-		cmd.Env = s.mesaEnv()
+		cmd := s.mesaCommand(ctx, prog, node, strconv.Itoa(buffers))
 		out, err := cmd.CombinedOutput()
 		cancel()
 		if !s.Check(err == nil, "round %d: vk-blobs maps %d buffers and exits%s, see %s",
@@ -1720,13 +1752,13 @@ func gpuTestWeston(s *gpuSuite) {
 		return
 	}
 	defer os.RemoveAll(rundir)
-	env := append(s.mesaEnv(), "XDG_RUNTIME_DIR="+rundir, "LIBSEAT_BACKEND=noop",
-		"WAYLAND_DISPLAY="+socket)
+	env := []string{"XDG_RUNTIME_DIR=" + rundir, "LIBSEAT_BACKEND=noop",
+		"WAYLAND_DISPLAY=" + socket}
 	start := g.Counters()
-	weston := exec.Command("weston", "--backend=drm", "--drm-device="+filepath.Base(card),
-		"--continue-without-input", "--idle-time=0", "--socket="+socket,
-		"--log="+filepath.Join(s.dir, "weston.log"))
-	weston.Env = env
+	weston := s.mesaCommand(context.Background(), "weston", "--backend=drm",
+		"--drm-device="+filepath.Base(card), "--continue-without-input", "--idle-time=0",
+		"--socket="+socket, "--log="+filepath.Join(s.dir, "weston.log"))
+	weston.Env = append(weston.Env, env...)
 	err = weston.Start()
 	if !s.Check(err == nil, "weston starts%s", errSuffix(err)) {
 		return
@@ -1767,10 +1799,10 @@ func gpuTestWeston(s *gpuSuite) {
 	// The client buffers its output and writes it when it exits, which it
 	// does in order on SIGINT.
 	ctx, cancel := context.WithTimeout(s.ctx, 11*time.Second)
-	client := exec.CommandContext(ctx, "weston-simple-egl", "-f")
+	client := s.mesaCommand(ctx, "weston-simple-egl", "-f")
 	client.Cancel = func() error { return client.Process.Signal(os.Interrupt) }
 	client.WaitDelay = 5 * time.Second
-	client.Env = env
+	client.Env = append(client.Env, env...)
 	out, _ := client.CombinedOutput()
 	cancel()
 	os.WriteFile(filepath.Join(s.dir, "simple-egl.log"), out, 0644)
@@ -1844,8 +1876,7 @@ func (s *gpuSuite) glmark2(test string, display bool) {
 	}
 	before := g.Counters()
 	ctx, cancel := context.WithTimeout(s.ctx, 10*time.Minute)
-	cmd := exec.CommandContext(ctx, "glmark2-drm", args...)
-	cmd.Env = s.mesaEnv()
+	cmd := s.mesaCommand(ctx, "glmark2-drm", args...)
 	out, err := cmd.CombinedOutput()
 	cancel()
 	os.WriteFile(filepath.Join(s.dir, "glmark2.log"), out, 0644)
