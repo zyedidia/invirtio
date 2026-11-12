@@ -23,18 +23,21 @@ Firmware options, which can be repeated:
                such as mt7921e or cfg80211
   -l <log>     every file that a guest boot log reports as missing
   -f <name>    one file, named as the driver requests it
+  -F <dir>     a firmware directory to read in place of the host's
 
 Other options:
   -i <script>  the init script, installed as /init. The default one mounts
                /dev, /proc and /sys and starts a shell
   -b <binary>  a host binary to add, with its shared libraries
 
-Firmware is read from /lib/firmware/updates and /lib/firmware. Compressed
-files are stored decompressed. regulatory.db and its signature come from the
--upstream files when the host has them, since the guest trusts only the
-upstream signing key and Debian points the standard names at its own build. A driver often lists firmware for several
-chips, so -d skips files that the host does not have. A guest that is still
-missing firmware logs each file it could not load, and -l adds those files.
+Firmware is read from the -F directories, in order, or else from
+/lib/firmware/updates and /lib/firmware. Compressed files are stored
+decompressed. regulatory.db and its signature come from the -upstream files
+when the host has them, since the guest trusts only the upstream signing key
+and Debian points the standard names at its own build. A driver often lists
+firmware for several chips, so -d skips files that the firmware directories
+do not have. A guest that is still missing firmware logs each file it could
+not load, and -l adds those files.
 EOF
     exit 2
 }
@@ -42,14 +45,16 @@ EOF
 MODULES=()
 LOGS=()
 FIRMWARE=()
+FW_DIRS=()
 BINARIES=()
 INIT=
 
-while getopts d:l:f:i:b:h opt; do
+while getopts d:l:f:F:i:b:h opt; do
     case $opt in
     d) MODULES+=("$OPTARG") ;;
     l) LOGS+=("$OPTARG") ;;
     f) FIRMWARE+=("$OPTARG") ;;
+    F) FW_DIRS+=("$OPTARG") ;;
     i) INIT=$OPTARG ;;
     b) BINARIES+=("$OPTARG") ;;
     *) usage ;;
@@ -73,6 +78,13 @@ MODINFO=$BUILD/modules.builtin.modinfo
 [ -f "$MODINFO" ] || die "$MODINFO does not exist, build the guest first"
 [ -z "$INIT" ] || [ -f "$INIT" ] || die "$INIT does not exist"
 BUSYBOX=$(command -v busybox) || die "busybox is not installed"
+if [ ${#FW_DIRS[@]} -gt 0 ]; then
+    for dir in "${FW_DIRS[@]}"; do
+        [ -d "$dir" ] || die "firmware directory $dir does not exist"
+    done
+else
+    FW_DIRS=(/lib/firmware/updates /lib/firmware)
+fi
 
 mkdir -p "$OUT"
 OUT=$(realpath "$OUT")
@@ -129,11 +141,10 @@ add_binary() {
     done
 }
 
-FW_DIRS=(/lib/firmware/updates /lib/firmware)
 FW_BYTES=0
 FW_COUNT=0
 
-# Add the firmware file <name>. Return 1 if the host does not have it.
+# Add the firmware file <name>. Return 1 if no firmware directory has it.
 add_firmware() {
     local name=$1 dir src dst upstream=
     [ -n "${HAVE[/lib/firmware/$name]:-}" ] && return 0
@@ -201,7 +212,7 @@ for mod in "${MODULES[@]}"; do
     names=$(tr '\0' '\n' < "$MODINFO" | sed -n "s/^$mod\.firmware=//p")
     [ -n "$names" ] || warn "module $mod has no MODULE_FIRMWARE entries in $BUILD"
     for name in $names; do
-        add_firmware "$name" || warn "skipping $name, which is not on the host"
+        add_firmware "$name" || warn "skipping $name, which was not found"
     done
 done
 
@@ -209,12 +220,12 @@ for log in "${LOGS[@]}"; do
     [ -f "$log" ] || die "$log does not exist"
     for name in $(sed -n 's/.*Direct firmware load for \([^ ]*\) failed with error.*/\1/p' "$log" |
                   sort -u); do
-        add_firmware "$name" || warn "$name is not on the host"
+        add_firmware "$name" || warn "$name was not found"
     done
 done
 
 for name in "${FIRMWARE[@]}"; do
-    add_firmware "$name" || die "$name is not on the host"
+    add_firmware "$name" || die "$name was not found"
 done
 
 GEN=$BUILD/usr/gen_init_cpio

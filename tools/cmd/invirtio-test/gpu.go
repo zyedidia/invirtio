@@ -127,8 +127,8 @@ type gpuSuite struct {
 	harness.Checker
 	build string
 	out   string
-	// device is the iGPU's PCI address, with its ROM, or "" for a guest
-	// without a GPU.
+	// device is the GPU's PCI address with its vfio_uml options, or "" for
+	// a guest without a GPU.
 	device string
 	// mesa is the prefix of the Mesa that scripts/mesa-build.sh built.
 	mesa string
@@ -167,23 +167,23 @@ process keeps a file of the device open, the run stops and leaves the
 device attached, since removing virtio_gpu would break the host. Build the
 guest with scripts/invirtio-build-guest.sh -t amdgpu. Without -device, the
 guest has no GPU, and the device reports a DRM capset of zeros. With
--device, the guest drives the iGPU, and the capset describes it. The host
-must then not use the iGPU, so stop the display manager first. Every test
-checks that the guest's error counters stay at zero, unless it sends
-commands that the device refuses, and that neither kernel logs a warning.
-The guests' consoles go to <test>/guest-<n>.log in the output directory.
-Run as root on the linux-host kernel.
+-device, the guest drives the GPU, and the capset describes it. The host
+must then not use the GPU, so stop the display manager first if the host
+uses it. Every test checks that the guest's error counters stay at zero,
+unless it sends commands that the device refuses, and that neither kernel
+logs a warning. The guests' consoles go to <test>/guest-<n>.log in the
+output directory. Run as root on the linux-host kernel.
 
 Tests:`+gpuTestList())
 	build := fs.String("guest", filepath.Join(root, "linux-uml/build-amdgpu"), "the build directory of the guest")
 	out := fs.String("out", filepath.Join(root, "build/test-gpu"), "the output directory")
-	device := fs.String("device", "", "the PCI address of the iGPU to pass through, such as 0000:01:00.0")
-	rom := fs.String("rom", "", "the VBIOS image of the iGPU")
+	device := fs.String("device", "", "the PCI address of the GPU to pass through, such as 0000:01:00.0 for the iGPU")
+	rom := fs.String("rom", "", "with -device, the VBIOS image of a GPU without a ROM BAR, such as the iGPU")
 	mesa := fs.String("mesa", filepath.Join(root, "build/mesa"), "the prefix of the Mesa that scripts/mesa-build.sh built")
 	runRE := fs.String("run", "", "run only the tests whose names match this regular expression")
 	vram := fs.Bool("vram", false, "with -device, place the mappable BOs that Mesa asks for in VRAM in CPU-visible VRAM, which the evict, pressure and bandwidth tests then use")
 	fs.Parse(args)
-	if fs.NArg() != 0 || (*rom != "") != (*device != "") || (*vram && *device == "") {
+	if fs.NArg() != 0 || (*device == "" && (*rom != "" || *vram)) {
 		fs.Usage()
 		os.Exit(2)
 	}
@@ -195,14 +195,17 @@ Tests:`+gpuTestList())
 
 	s := &gpuSuite{build: *build, mesa: *mesa, vram: *vram, stopped: map[*harness.Guest]bool{}}
 	if *device != "" {
-		r, err := filepath.Abs(*rom)
-		if err != nil {
-			return err
-		}
-		// The guest writes VRAM through the iGPU's BAR0, which native
+		// The guest writes VRAM through the GPU's BAR0, which native
 		// amdgpu maps write-combined, and the host's mappings of VRAM BOs
 		// take BAR0's memory type. The doorbells in BAR2 stay uncached.
-		s.device = *device + ",rom=" + r + ",wc_bars=0x1"
+		s.device = *device + ",wc_bars=0x1"
+		if *rom != "" {
+			r, err := filepath.Abs(*rom)
+			if err != nil {
+				return err
+			}
+			s.device += ",rom=" + r
+		}
 	}
 	if s.out, err = filepath.Abs(*out); err != nil {
 		return err

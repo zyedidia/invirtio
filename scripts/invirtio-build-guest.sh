@@ -17,9 +17,10 @@
 #   wlan-test     the guest that invirtio-test test-wlan runs, which exports
 #                 a mac80211_hwsim radio and runs access points on three
 #                 others.
-#   amdgpu        the guest for the MS-A2's iGPU, with its firmware, which
-#                 exports a render node as a virtio-gpu device, and which
-#                 invirtio-test test-gpu runs.
+#   amdgpu        the guest that invirtio-test test-gpu runs, which drives
+#                 the MS-A2's iGPU or the Radeon PRO W6400 with firmware
+#                 from linux-firmware and exports a render node as a
+#                 virtio-gpu device.
 #   invirtio-gpu  the guest of GPUs that invirtio install -gpu-guest takes,
 #                 the amdgpu guest with the driver guest's init.
 #
@@ -43,7 +44,7 @@ TARGET=invirtio
 while getopts t:h opt; do
     case $opt in
     t) TARGET=$OPTARG ;;
-    *) sed -n '2,31s/^# \{0,1\}//p' "$0" >&2; exit 2 ;;
+    *) sed -n '2,/^$/s/^# \{0,1\}//p' "$0" >&2; exit 2 ;;
     esac
 done
 shift $((OPTIND - 1))
@@ -83,8 +84,12 @@ amdgpu | invirtio-gpu)
     else
         INITRAMFS=(-i "$ROOT/scripts/invirtio-guest-init")
     fi
+    [ -d "$ROOT/linux-firmware/amdgpu" ] ||
+        { echo "${0##*/}: no linux-firmware, run ./download.sh" >&2; exit 1; }
+    INITRAMFS+=(-F "$ROOT/linux-firmware")
     for f in gc_10_3_6_{ce,me,mec,mec2,pfp,rlc} psp_13_0_5_{toc,ta,asd} \
-             sdma_5_2_6 dcn_3_1_5_dmcub vcn_3_1_2; do
+             sdma_5_2_6 dcn_3_1_5_dmcub vcn_3_1_2 \
+             beige_goby_{ce,me,mec,mec2,pfp,rlc,sdma,smc,sos,ta,dmcub,vcn}; do
         INITRAMFS+=(-f "amdgpu/$f.bin")
     done
     ;;

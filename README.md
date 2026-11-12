@@ -14,7 +14,8 @@ exports a VirtIO device to the host using VDUSE.
   are contained to kernel modules so they can be reloaded without rebooting the
   host kernel (after installing a custom kernel in the host).
 
-Run `./download.sh --shallow` to download the two Linux kernels.
+Run `./download.sh --shallow` to download the two Linux kernels and the GPU
+firmware.
 
 ## Requirements
 
