@@ -5,6 +5,5 @@ linux-host/linux
 linux-uml/linux
 linux-firmware
 references
-PATCH.md
-CLAUDE.md
 kvm/cloud-hypervisor
+REVIEW-*
